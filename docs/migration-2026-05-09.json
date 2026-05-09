@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "started_at": "2026-05-09T19:09:07Z",
+  "v1_path": "/home/kevin/Projects/NanoClaw",
+  "v1_version": "1.2.17",
+  "overall_status": "success",
+  "completed_at": "2026-05-09T19:46:14Z",
+  "aborted_at": "",
+  "source": "migrate-v2.sh",
+  "channels_installed": ["telegram"],
+  "onecli_healthy": true,
+  "service_switched": true,
+  "service_unit": "nanoclaw-v2-7eae8a07",
+  "steps": {"1a-env": {"status": "success", "log": "logs/migrate-steps/1a-env.log"},"1b-db": {"status": "success", "log": "logs/migrate-steps/1b-db.log"},"1c-groups": {"status": "success", "log": "logs/migrate-steps/1c-groups.log"},"1d-sessions": {"status": "success", "log": "logs/migrate-steps/1d-sessions.log"},"1e-tasks": {"status": "success", "log": "logs/migrate-steps/1e-tasks.log"},"2b-channel-auth": {"status": "success", "log": "logs/migrate-steps/2b-channel-auth.log"},"2c-install-telegram": {"status": "success", "log": "logs/migrate-steps/2c-install-telegram.log"},"3b-onecli": {"status": "success", "log": "logs/migrate-steps/3b-onecli.log"},"3e-build": {"status": "success", "log": "logs/migrate-steps/3e-container-build.log"}},
+  "step_logs_dir": "logs/migrate-steps",
+  "followups": [
+    "Seed owner user and access policy",
+    "Review CLAUDE.local.md files for v1-specific patterns",
+    "Verify container.json mount paths are valid"
+  ],
+  "post_migration_actions": [
+    "Installed docker-buildx (was missing, blocked container build)",
+    "Built agent container image: nanoclaw-agent-v2-7eae8a07:latest",
+    "Installed v2 systemd unit: nanoclaw-v2-7eae8a07.service",
+    "Registered Anthropic OAuth token in OneCLI vault (was missing post-3b-onecli)",
+    "Granted owner role to telegram:8641759772",
+    "Tightened unknown_sender_policy=strict on telegram and tgc messaging groups",
+    "Trimmed groups/telegram_main/CLAUDE.local.md from 440 to 147 lines (removed v1 boilerplate now in fragments)",
+    "Fixed /workspace/group->/workspace/agent path in groups/companion/CLAUDE.local.md",
+    "Updated Prusa MCP tool names to match v2 (mcp__nanoclaw__prusa_status etc)",
+    "Replaced Ollama MCP references with curl http://172.17.0.1:11434 (no v2 ollama-tool skill exists)",
+    "Phase 4 (fork porting) skipped — v1 install was project dev checkout, nothing personal to port"
+  ]
+}
