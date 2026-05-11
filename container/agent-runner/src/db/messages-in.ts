@@ -25,6 +25,15 @@ export interface MessageInRow {
   channel_type: string | null;
   thread_id: string | null;
   content: string;
+  /**
+   * For kind='task' rows: how much prior conversation context the agent
+   * sees when this task fires. NULL = v2 default (full continuation).
+   *   'none'   — drop SDK continuation, no prior context
+   *   'recent' — drop continuation, include last ~10 inbound rows as context
+   *   'full'   — keep continuation (same as NULL)
+   * Ignored for non-task rows.
+   */
+  context_mode?: string | null;
 }
 
 // Cap on how many messages reach the agent in one prompt. Read from

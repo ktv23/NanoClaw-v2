@@ -14,7 +14,22 @@ import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { cancelTask, insertTask, pauseTask, resumeTask, updateTask, type TaskUpdate } from './db.js';
+import {
+  cancelTask,
+  insertTask,
+  pauseTask,
+  resumeTask,
+  updateTask,
+  type TaskContextMode,
+  type TaskUpdate,
+} from './db.js';
+
+const VALID_CONTEXT_MODES: ReadonlySet<TaskContextMode> = new Set(['none', 'recent', 'full']);
+
+function coerceContextMode(value: unknown): TaskContextMode | null {
+  if (typeof value !== 'string') return null;
+  return (VALID_CONTEXT_MODES as Set<string>).has(value) ? (value as TaskContextMode) : null;
+}
 
 export async function handleScheduleTask(
   content: Record<string, unknown>,
@@ -26,6 +41,8 @@ export async function handleScheduleTask(
   const script = content.script as string | null;
   const processAfter = content.processAfter as string;
   const recurrence = (content.recurrence as string) || null;
+  // Unknown/missing values fall back to NULL → v2 default (full).
+  const contextMode = coerceContextMode(content.contextMode);
 
   insertTask(inDb, {
     id: taskId,
@@ -35,8 +52,9 @@ export async function handleScheduleTask(
     channelType: (content.channelType as string) ?? null,
     threadId: (content.threadId as string) ?? null,
     content: JSON.stringify({ prompt, script }),
+    contextMode,
   });
-  log.info('Scheduled task created', { taskId, processAfter, recurrence });
+  log.info('Scheduled task created', { taskId, processAfter, recurrence, contextMode });
 }
 
 export async function handleCancelTask(

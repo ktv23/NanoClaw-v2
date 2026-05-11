@@ -14,6 +14,17 @@ import type Database from 'better-sqlite3';
 
 import { nextEvenSeq } from '../../db/session-db.js';
 
+/**
+ * Allowed values for `context_mode` on a task row. NULL/undefined means
+ * "use the v2 default" (full continuation).
+ *
+ * Ported from v1's scheduled_tasks.context_mode:
+ *   v1 'isolated' → v2 'none'   (no prior context, fresh session)
+ *   v1 'group'    → v2 'full'   (use existing continuation)
+ *   v2 also adds 'recent' (drop continuation, prepend last ~10 inbound rows).
+ */
+export type TaskContextMode = 'none' | 'recent' | 'full';
+
 export function insertTask(
   db: Database.Database,
   task: {
@@ -24,13 +35,19 @@ export function insertTask(
     channelType: string | null;
     threadId: string | null;
     content: string;
+    /**
+     * How much prior conversation context the agent sees when this task
+     * fires. Omit or pass null to use the v2 default (same as 'full').
+     */
+    contextMode?: TaskContextMode | null;
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @id)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, context_mode)
+     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @id, @contextMode)`,
   ).run({
     ...task,
+    contextMode: task.contextMode ?? null,
     seq: nextEvenSeq(db),
   });
 }
@@ -117,6 +134,7 @@ export interface RecurringMessage {
   channel_type: string | null;
   thread_id: string | null;
   series_id: string;
+  context_mode: string | null;
 }
 
 export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
@@ -132,8 +150,8 @@ export function insertRecurrence(
   nextRun: string | null,
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id, context_mode)
+     VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     newId,
     nextEvenSeq(db),
@@ -145,6 +163,9 @@ export function insertRecurrence(
     msg.thread_id,
     msg.content,
     msg.series_id,
+    // Carry context_mode forward so each occurrence in a recurring series
+    // fires with the same context behavior. NULL stays NULL (default).
+    msg.context_mode ?? null,
   );
 }
 

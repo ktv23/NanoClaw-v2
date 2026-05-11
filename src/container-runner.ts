@@ -418,6 +418,11 @@ async function buildContainerArgs(
     }
   }
 
+  // Forwarded host env vars consumed by in-process MCP tools.
+  for (const key of ['PRUSA_URL', 'PRUSA_API_KEY']) {
+    if (process.env[key]) args.push('-e', `${key}=${process.env[key]}`);
+  }
+
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection. Treated as
   // a transient hard failure: if we can't wire the gateway, we don't spawn.

@@ -6,10 +6,12 @@ import { clearContinuation, migrateLegacyContinuation, setContinuation } from '.
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
   formatMessages,
+  formatMessagesForFiring,
   extractRouting,
   categorizeMessage,
   isClearCommand,
   isRunnerCommand,
+  resolveTaskContextMode,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -165,11 +167,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
+    // Task-row context_mode controls how much prior conversation the agent
+    // sees when a task fires. 'none' → start fresh; 'recent' → fresh + last
+    // ~10 inbound rows already prepended by formatMessagesWithCommands.
+    // For 'full' / NULL, the existing continuation is kept as-is.
+    // Only applies when the batch is purely task rows — slash commands and
+    // chat messages always run with the existing continuation.
+    const firingContextMode = resolveTaskContextMode(keep);
+    const queryContinuation =
+      firingContextMode === 'none' || firingContextMode === 'recent' ? undefined : continuation;
+    if (queryContinuation === undefined && continuation !== undefined) {
+      log(`Task context_mode=${firingContextMode} — running this query without prior continuation`);
+    }
+
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
     const query = config.provider.query({
       prompt,
-      continuation,
+      continuation: queryContinuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
     });
@@ -224,6 +239,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * When the provider handles slash commands natively (Claude Code),
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
+ *
+ * Task-row context_mode is also applied here so the recent-context preamble
+ * (when context_mode='recent') is included in the firing prompt.
  */
 function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
@@ -235,7 +253,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // Flush normal batch first
         if (normalBatch.length > 0) {
-          parts.push(formatMessages(normalBatch));
+          parts.push(formatMessagesForFiring(normalBatch).prompt);
           normalBatch.length = 0;
         }
         // Pass raw command text (no XML wrapping) — SDK handles it natively
@@ -247,7 +265,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
   }
 
   if (normalBatch.length > 0) {
-    parts.push(formatMessages(normalBatch));
+    parts.push(formatMessagesForFiring(normalBatch).prompt);
   }
 
   return parts.join('\n\n');

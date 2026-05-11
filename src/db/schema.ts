@@ -177,9 +177,18 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- group's "newest" session. NULL on channel-side inbound and on a2a rows
   -- written before this column existed.
   source_session_id TEXT,
-  on_wake        INTEGER NOT NULL DEFAULT 0
+  on_wake        INTEGER NOT NULL DEFAULT 0,
                -- 1 = only deliver on the container's first poll (fresh start).
                -- Dying containers (past first poll) skip these rows.
+  -- For kind='task' rows: how much prior conversation context the agent
+  -- sees when this task fires. NULL = v2 default (full continuation).
+  -- Values:
+  --   'none'   — fresh agent session, no prior context
+  --   'recent' — drop continuation but include the last ~10 inbound rows
+  --              as accumulated context
+  --   'full'   — same as NULL: keep the existing continuation
+  -- Ported from v1's scheduled_tasks.context_mode ('isolated' / 'group').
+  context_mode   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
 

@@ -197,7 +197,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       channel_type   TEXT,
       thread_id      TEXT,
       content        TEXT NOT NULL,
-      on_wake        INTEGER NOT NULL DEFAULT 0
+      on_wake        INTEGER NOT NULL DEFAULT 0,
+      context_mode   TEXT
     );
     CREATE TABLE delivered (
       message_out_id      TEXT PRIMARY KEY,

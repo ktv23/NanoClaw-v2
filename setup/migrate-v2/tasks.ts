@@ -20,7 +20,7 @@ import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';
 import { getMessagingGroupByPlatform } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
-import { insertTask } from '../../src/modules/scheduling/db.js';
+import { insertTask, type TaskContextMode } from '../../src/modules/scheduling/db.js';
 import { openInboundDb, resolveSession } from '../../src/session-manager.js';
 import { readEnvFile } from '../../src/env.js';
 import { buildDiscordResolver, type DiscordResolver } from './discord-resolver.js';
@@ -145,6 +145,14 @@ async function main(): Promise<void> {
           .get(t.id) as { id: string } | undefined;
         if (existing) { skipped++; continue; }
 
+        // v1 used 'isolated' / 'group'; v2 uses 'none' / 'recent' / 'full'.
+        // Map the two v1 values to their v2 equivalents; anything else stays null
+        // (= v2 default behavior). Preserve the original v1 value in the JSON
+        // marker for traceability.
+        let contextMode: TaskContextMode | null = null;
+        if (t.context_mode === 'isolated') contextMode = 'none';
+        else if (t.context_mode === 'group') contextMode = 'full';
+
         insertTask(inboxDb, {
           id: t.id,
           processAfter: scheduling.processAfter,
@@ -157,6 +165,7 @@ async function main(): Promise<void> {
             script: t.script ?? null,
             migrated_from_v1: { original_id: t.id, context_mode: t.context_mode ?? null },
           }),
+          contextMode,
         });
         migrated++;
       } finally {

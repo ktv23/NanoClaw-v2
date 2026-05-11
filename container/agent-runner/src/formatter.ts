@@ -1,6 +1,73 @@
 import { findByRouting } from './destinations.js';
+import { openInboundDb } from './db/connection.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
+
+/** Number of prior inbound rows to include when context_mode='recent'. */
+const RECENT_CONTEXT_LIMIT = 10;
+
+/**
+ * Resolved task-context behavior for a firing batch.
+ *
+ *   'full'   — keep the SDK continuation, no extra context injected (default)
+ *   'none'   — drop continuation for this query; only the task itself is shown
+ *   'recent' — drop continuation; prepend up to RECENT_CONTEXT_LIMIT prior
+ *              inbound rows as accumulated context
+ *
+ * Only applies when the batch contains task rows. Chat-only batches always
+ * resolve to 'full'.
+ */
+export type EffectiveTaskContextMode = 'none' | 'recent' | 'full';
+
+/**
+ * Resolve the effective context mode for a batch about to fire.
+ *
+ * If the batch has any task rows, the most-restrictive mode wins so a
+ * 'none' task in a mixed batch still gets a fresh window. NULL/unknown
+ * task context_mode values are treated as 'full' (the v2 default).
+ */
+export function resolveTaskContextMode(messages: MessageInRow[]): EffectiveTaskContextMode {
+  let result: EffectiveTaskContextMode = 'full';
+  for (const m of messages) {
+    if (m.kind !== 'task') continue;
+    const mode = m.context_mode;
+    if (mode === 'none') return 'none'; // most restrictive — short-circuit
+    if (mode === 'recent' && result === 'full') result = 'recent';
+  }
+  return result;
+}
+
+/**
+ * Fetch the most recent prior inbound rows for the 'recent' context mode.
+ * Excludes the firing batch itself (matched by id) and skips system rows
+ * (MCP responses) and other task rows so the agent gets the conversation
+ * history rather than other scheduled tasks.
+ *
+ * Returns rows in chronological order (oldest first) so the formatter can
+ * prepend them directly. Errors fall back to an empty array — the task
+ * still fires, just without the recent-context preamble.
+ */
+export function fetchRecentContextRows(excludeIds: string[]): MessageInRow[] {
+  let db: ReturnType<typeof openInboundDb> | null = null;
+  try {
+    db = openInboundDb();
+    const placeholders = excludeIds.length > 0 ? excludeIds.map(() => '?').join(',') : "''";
+    const rows = db
+      .prepare(
+        `SELECT * FROM messages_in
+         WHERE kind IN ('chat', 'chat-sdk')
+           AND id NOT IN (${placeholders})
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(...excludeIds, RECENT_CONTEXT_LIMIT) as MessageInRow[];
+    return rows.reverse();
+  } catch {
+    return [];
+  } finally {
+    db?.close();
+  }
+}
 
 /**
  * Command categories for messages starting with '/'.
@@ -112,6 +179,55 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
   };
+}
+
+/**
+ * Build the prompt for a firing batch, applying task-row context_mode rules.
+ *
+ *   'full' (default / NULL): identical to formatMessages(messages)
+ *   'none':                  identical to formatMessages(messages) — but the
+ *                            poll-loop also drops the SDK continuation, so
+ *                            the agent starts fresh with just the batch
+ *   'recent':                prepend a <recent_context> block containing up to
+ *                            RECENT_CONTEXT_LIMIT prior chat rows formatted
+ *                            normally; poll-loop drops the SDK continuation
+ *                            so this is the only prior context the agent sees
+ *
+ * Returned modeApplied is what the caller should use to decide whether to
+ * drop the SDK continuation for this query.
+ */
+export function formatMessagesForFiring(messages: MessageInRow[]): {
+  prompt: string;
+  mode: EffectiveTaskContextMode;
+} {
+  const mode = resolveTaskContextMode(messages);
+
+  if (mode !== 'recent') {
+    return { prompt: formatMessages(messages), mode };
+  }
+
+  const excludeIds = messages.map((m) => m.id);
+  const priorRows = fetchRecentContextRows(excludeIds);
+  if (priorRows.length === 0) {
+    return { prompt: formatMessages(messages), mode };
+  }
+
+  // Format prior rows the same way as the live batch, then wrap in a marker
+  // so the agent can tell preamble from the actual trigger. Strip the
+  // duplicate timezone header off the inner format — the outer one is enough.
+  const innerCtxHeader = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
+  const priorFormatted = formatMessages(priorRows);
+  const priorBody = priorFormatted.startsWith(innerCtxHeader)
+    ? priorFormatted.slice(innerCtxHeader.length)
+    : priorFormatted;
+
+  const liveFormatted = formatMessages(messages);
+  const liveBody = liveFormatted.startsWith(innerCtxHeader)
+    ? liveFormatted.slice(innerCtxHeader.length)
+    : liveFormatted;
+
+  const prompt = `${innerCtxHeader}<recent_context>\n${priorBody}\n</recent_context>\n\n${liveBody}`;
+  return { prompt, mode };
 }
 
 /**

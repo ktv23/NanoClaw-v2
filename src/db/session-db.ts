@@ -329,6 +329,16 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // All existing rows are normal messages, so default 0.
     db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
   }
+  if (!cols.has('context_mode')) {
+    // Ported from v1's scheduled_tasks.context_mode. Controls how much prior
+    // conversation context the agent sees when a task row fires:
+    //   'none'   — drop SDK continuation, no prior context
+    //   'recent' — drop continuation but include last ~10 inbound rows
+    //   'full'   — keep continuation (v2 default behavior)
+    //   NULL     — same as 'full' (default)
+    // Existing rows stay NULL → unchanged behavior.
+    db.prepare('ALTER TABLE messages_in ADD COLUMN context_mode TEXT').run();
+  }
 }
 
 /**

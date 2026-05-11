@@ -54,6 +54,96 @@ describe('insertTask', () => {
     expect(row.series_id).toBe('task-1');
     db.close();
   });
+
+  it('round-trips contextMode on insert', () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-none',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'p' }),
+      contextMode: 'none',
+    });
+    insertTask(db, {
+      id: 'task-recent',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'p' }),
+      contextMode: 'recent',
+    });
+    insertTask(db, {
+      id: 'task-full',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'p' }),
+      contextMode: 'full',
+    });
+    insertTask(db, {
+      id: 'task-default',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'p' }),
+      // contextMode omitted → NULL in DB (= v2 default)
+    });
+
+    const rows = db.prepare('SELECT id, context_mode FROM messages_in ORDER BY id').all() as Array<{
+      id: string;
+      context_mode: string | null;
+    }>;
+    const byId = Object.fromEntries(rows.map((r) => [r.id, r.context_mode]));
+    expect(byId['task-none']).toBe('none');
+    expect(byId['task-recent']).toBe('recent');
+    expect(byId['task-full']).toBe('full');
+    expect(byId['task-default']).toBeNull();
+    db.close();
+  });
+
+  it('carries context_mode forward on insertRecurrence', () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-orig',
+      processAfter: new Date().toISOString(),
+      recurrence: '0 9 * * *',
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'p' }),
+      contextMode: 'recent',
+    });
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'task-orig'").run();
+
+    const msg: RecurringMessage = {
+      id: 'task-orig',
+      kind: 'task',
+      content: JSON.stringify({ prompt: 'p' }),
+      recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      series_id: 'task-orig',
+      context_mode: 'recent',
+    };
+    insertRecurrence(db, msg, 'task-next', new Date(Date.now() + 86400000).toISOString());
+
+    const row = db.prepare('SELECT context_mode FROM messages_in WHERE id = ?').get('task-next') as {
+      context_mode: string | null;
+    };
+    expect(row.context_mode).toBe('recent');
+    db.close();
+  });
 });
 
 describe('cancelTask / pauseTask / resumeTask series matching', () => {
@@ -76,6 +166,7 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
       channel_type: null,
       thread_id: null,
       series_id: 'task-orig',
+      context_mode: null,
     };
     insertRecurrence(db, msg, 'task-next', new Date(Date.now() + 86400000).toISOString());
   }
@@ -221,6 +312,7 @@ describe('updateTask', () => {
       channel_type: null,
       thread_id: null,
       series_id: 'task-orig',
+      context_mode: null,
     };
     insertRecurrence(db, msg, 'task-next', new Date(Date.now() + 86400000).toISOString());
 
@@ -270,6 +362,7 @@ describe('insertRecurrence', () => {
       channel_type: null,
       thread_id: null,
       series_id: 'task-orig',
+      context_mode: null,
     };
     insertRecurrence(db, msg, 'task-next', new Date().toISOString());
 
