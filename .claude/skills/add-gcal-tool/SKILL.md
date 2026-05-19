@@ -92,7 +92,6 @@ onecli agents list
 
 ```bash
 grep -q 'CALENDAR_MCP_VERSION' container/Dockerfile && \
-grep -q "mcp__calendar__\*" container/agent-runner/src/providers/claude.ts && \
 echo "ALREADY APPLIED — skip to Phase 3"
 ```
 
@@ -121,9 +120,9 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@cocal/google-calendar-mcp@${CALENDAR_MCP_VERSION}"
 ```
 
-### Add tools to allowlist
+### Tool allowlist (no edit needed)
 
-Edit `container/agent-runner/src/providers/claude.ts`. Add `'mcp__calendar__*'` to `TOOL_ALLOWLIST` after `'mcp__nanoclaw__*'` (or after `'mcp__gmail__*'` if present).
+The `mcp__calendar__*` pattern is appended automatically at session start — `container/agent-runner/src/providers/claude.ts` does `Object.keys(this.mcpServers).map(mcpAllowPattern)` and merges that into `allowedTools`. As long as `calendar` is in the group's `mcpServers` (Phase 3 below), the tools are reachable. Earlier versions of this skill instructed editing `TOOL_ALLOWLIST` directly; that step is now a no-op and has been removed.
 
 ### Rebuild the container image
 

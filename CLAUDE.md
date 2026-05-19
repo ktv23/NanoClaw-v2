@@ -179,6 +179,26 @@ onecli secrets list                                    # all vault secrets (with
 
 If you've just enabled `mode all`, no container restart is needed — the gateway looks up secrets per request, so the next API call from the running container will see the new credentials.
 
+### Gotcha: Google OAuth rejects private-IP redirect URIs
+
+OneCLI's `~/.onecli/docker-compose.yml` defaults `APP_URL` / `NEXT_PUBLIC_APP_URL` to `http://${ONECLI_BIND_HOST:-172.17.0.1}:10254`. That URL is used as the OAuth callback when you Connect a Google app (Gmail, Calendar, Drive, etc.) in the web UI. **Google blocks private-IP addresses in `redirect_uri` for Desktop-app OAuth clients** — only `localhost` and `127.0.0.1` are accepted loopback addresses. The Connect flow fails with:
+
+```
+Error 400: invalid_request
+device_id and device_name are required for private IP: http://172.17.0.1:10254/api/apps/<app>/callback
+```
+
+Fix: hardcode `APP_URL` and `NEXT_PUBLIC_APP_URL` to `http://localhost:10254` in the compose file, leaving the **port binding** on `172.17.0.1` so agent containers can still reach the OneCLI gateway on port 10255:
+
+```yaml
+NEXT_PUBLIC_APP_URL: http://localhost:${ONECLI_APP_PORT:-10254}
+APP_URL: http://localhost:${ONECLI_APP_PORT:-10254}
+```
+
+Then `cd ~/.onecli && docker compose up -d onecli` to recreate the container. No sudo needed; takes ~10s.
+
+Browser access from a dev machine uses an SSH tunnel: `ssh -N -L 10254:172.17.0.1:10254 kevin@<host>` → open `http://localhost:10254`. Desktop-app OAuth clients auto-accept any loopback callback, so no Google Cloud Console redirect-URI registration is needed once `APP_URL` is localhost. If GCP throws `redirect_uri_mismatch` anyway, the client type is set to Web app — add `http://localhost:10254/api/apps/<provider>/callback` to Authorized redirect URIs.
+
 ### Requiring approval for credential use
 
 Approval-gating credentialed actions is a **two-sided** flow:

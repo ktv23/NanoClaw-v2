@@ -98,7 +98,6 @@ onecli agents secrets --id <agent-id>
 
 ```bash
 grep -q 'GMAIL_MCP_VERSION' container/Dockerfile && \
-grep -q "mcp__gmail__\*" container/agent-runner/src/providers/claude.ts && \
 echo "ALREADY APPLIED — skip to Phase 3"
 ```
 
@@ -132,9 +131,9 @@ Pinned version matters — `minimumReleaseAge` in `pnpm-workspace.yaml` gates tr
 
 **Why the `zod-to-json-schema` pin:** `@gongrzhe/server-gmail-autoauth-mcp@1.1.11` has loose deps (`zod-to-json-schema: ^3.22.1`, `zod: ^3.22.4`). pnpm resolves `zod-to-json-schema` to the latest 3.25.x, which imports `zod/v3` — a subpath that only exists in `zod>=3.25`. But `zod` resolves to `3.24.x` (highest satisfying `^3.22.4` without breaking peer ranges). Result: `ERR_PACKAGE_PATH_NOT_EXPORTED` at import time. Pinning `zod-to-json-schema` to a pre-v3-subpath version avoids it. Re-check if you bump `GMAIL_MCP_VERSION`.
 
-### Add tools to allowlist
+### Tool allowlist (no edit needed)
 
-Edit `container/agent-runner/src/providers/claude.ts`. Find `'mcp__nanoclaw__*',` in `TOOL_ALLOWLIST` and add `'mcp__gmail__*',` after it.
+The `mcp__gmail__*` pattern is appended automatically at session start — `container/agent-runner/src/providers/claude.ts` does `Object.keys(this.mcpServers).map(mcpAllowPattern)` and merges that into `allowedTools`. As long as `gmail` is in the group's `mcpServers` (Phase 3 below), the tools are reachable. Earlier versions of this skill instructed editing `TOOL_ALLOWLIST` directly; that step is now a no-op and has been removed.
 
 ### Rebuild the container image
 
