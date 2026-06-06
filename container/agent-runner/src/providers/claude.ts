@@ -1,7 +1,11 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { promisify } from 'util';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+
+const execFileAsync = promisify(execFile);
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
@@ -188,6 +192,52 @@ const postToolUseHook: HookCallback = async () => {
   return { continue: true };
 };
 
+/**
+ * UserPromptSubmit hook: persistent memory (mnemon) recall injection.
+ *
+ * The agent-runner drives the Agent SDK, which fires hooks passed here
+ * programmatically — it does NOT execute the SessionStart/UserPromptSubmit
+ * hooks that `mnemon setup` writes into ~/.claude/settings.json. So mnemon's
+ * recall is wired in directly: before each turn we run `mnemon recall` on the
+ * user's message and inject the top matches as additionalContext, so the
+ * agent sees relevant long-term memory without having to ask for it.
+ *
+ * Fully gated on MNEMON_DATA_DIR — a no-op (returns {}) on any install that
+ * doesn't ship mnemon. Fails open on every error (missing binary, timeout,
+ * bad JSON) so memory can never block or break a turn.
+ */
+const userPromptSubmitHook: HookCallback = async (input) => {
+  const dataDir = process.env.MNEMON_DATA_DIR;
+  if (!dataDir) return {};
+
+  const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
+  if (prompt.length < 3) return {};
+
+  try {
+    const { stdout } = await execFileAsync('mnemon', ['recall', prompt], {
+      timeout: 8000,
+      maxBuffer: 4 * 1024 * 1024,
+      env: process.env,
+    });
+    const results = (JSON.parse(stdout)?.results ?? []) as Array<{ content?: string; score?: number }>;
+    const lines = results
+      .filter((r) => typeof r.content === 'string' && (r.score ?? 0) >= 0.25)
+      .slice(0, 8)
+      .map((r) => `- ${r.content}`);
+    if (lines.length === 0) return {};
+
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: `Relevant long-term memory (from your persistent memory store; use what's relevant, ignore what isn't):\n${lines.join('\n')}`,
+      },
+    } as unknown as ReturnType<HookCallback>;
+  } catch (err) {
+    log(`mnemon recall skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+};
+
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
@@ -309,6 +359,7 @@ export class ClaudeProvider implements AgentProvider {
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+          UserPromptSubmit: [{ hooks: [userPromptSubmitHook] }],
         },
       },
     });
