@@ -189,7 +189,8 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       platform_id: event.platformId,
       name: null,
       is_group: event.message.isGroup ? 1 : 0,
-      unknown_sender_policy: 'request_approval',
+      // SMS is a personal inbox bridge — every sender is the user's own contact.
+      unknown_sender_policy: event.channelType === 'sms' ? 'public' : 'request_approval',
       denied_at: null,
       created_at: new Date().toISOString(),
     };
