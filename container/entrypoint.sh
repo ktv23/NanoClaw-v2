@@ -11,7 +11,9 @@
 
 set -e
 
-mnemon setup --target claude-code --yes --global >/dev/stderr 2>&1
+# Memory is best-effort — a setup failure must never block the agent from
+# starting (set -e is active), so swallow non-zero exits.
+mnemon setup --target claude-code --yes --global >/dev/stderr 2>&1 || true
 
 cat > /tmp/input.json
 
