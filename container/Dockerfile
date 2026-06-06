@@ -121,6 +121,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@cocal/google-calendar-mcp@${CALENDAR_MCP_VERSION}" \
         "zod-to-json-schema@3.22.5"
 
+# ---- mnemon — persistent agent memory ----------------------------------------
+ARG MNEMON_VERSION=0.1.13
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin mnemon && \
+    chmod +x /usr/local/bin/mnemon
+
+ENV MNEMON_DATA_DIR=/home/node/.claude/mnemon
+
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
