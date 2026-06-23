@@ -193,19 +193,33 @@ const postToolUseHook: HookCallback = async () => {
 };
 
 /**
- * UserPromptSubmit hook: persistent memory (mnemon) recall injection.
+ * Persistent memory (mnemon) — per-turn recall injection AND a write directive.
  *
  * The agent-runner drives the Agent SDK, which fires hooks passed here
- * programmatically — it does NOT execute the SessionStart/UserPromptSubmit
- * hooks that `mnemon setup` writes into ~/.claude/settings.json. So mnemon's
- * recall is wired in directly: before each turn we run `mnemon recall` on the
- * user's message and inject the top matches as additionalContext, so the
- * agent sees relevant long-term memory without having to ask for it.
+ * programmatically — it does NOT execute the SessionStart/UserPromptSubmit/Stop
+ * hooks that `mnemon setup` writes into ~/.claude/settings.json. mnemon's write
+ * side is suggestion-mode (its Stop hook only *prints* "consider remembering";
+ * the model must call `mnemon remember` itself). With that nudge never reaching
+ * the SDK model, recall worked but nothing was ever written — the store stayed
+ * frozen at its last manual seed. So both sides are wired in here directly:
+ *
+ *  - Recall: run `mnemon recall` on the user's message, inject top matches.
+ *  - Remember: append a standing directive so the capable model evaluates,
+ *    in-turn, whether anything durable was shared and persists it via
+ *    `mnemon remember`. Doing it in-turn (vs. a forced extra turn) avoids
+ *    double-delivering a message, and letting the main model judge durability
+ *    keeps transient/operational junk out of the store.
  *
  * Fully gated on MNEMON_DATA_DIR — a no-op (returns {}) on any install that
  * doesn't ship mnemon. Fails open on every error (missing binary, timeout,
  * bad JSON) so memory can never block or break a turn.
  */
+const MNEMON_REMEMBER_DIRECTIVE = [
+  'Persistent memory — writing: after you finish handling this message, judge whether the user shared anything durable worth keeping long-term (a stable preference, a fact about them or the people/projects in their life, a decision, or lasting context). If so, store it — silently, via the Bash tool, without telling the user — by running:',
+  "  mnemon remember '<one concise sentence>' --cat <preference|fact|decision|context|insight> --source agent --entities '<comma-separated names, if any>'",
+  "Store at most the one or two most important items. Do NOT store: small talk, transient or operational state (what is/isn't running right now, errors, one-off task status), anything already in memory, or anything the user asked you not to keep. Run nothing when nothing durable came up.",
+].join('\n');
+
 const userPromptSubmitHook: HookCallback = async (input) => {
   const dataDir = process.env.MNEMON_DATA_DIR;
   if (!dataDir) return {};
@@ -213,6 +227,7 @@ const userPromptSubmitHook: HookCallback = async (input) => {
   const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
   if (prompt.length < 3) return {};
 
+  let recalled = '';
   try {
     const { stdout } = await execFileAsync('mnemon', ['recall', prompt], {
       timeout: 8000,
@@ -224,18 +239,23 @@ const userPromptSubmitHook: HookCallback = async (input) => {
       .filter((r) => typeof r.content === 'string' && (r.score ?? 0) >= 0.25)
       .slice(0, 8)
       .map((r) => `- ${r.content}`);
-    if (lines.length === 0) return {};
-
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'UserPromptSubmit',
-        additionalContext: `Relevant long-term memory (from your persistent memory store; use what's relevant, ignore what isn't):\n${lines.join('\n')}`,
-      },
-    } as unknown as ReturnType<HookCallback>;
+    if (lines.length > 0) {
+      recalled = `Relevant long-term memory (from your persistent memory store; use what's relevant, ignore what isn't):\n${lines.join('\n')}`;
+    }
   } catch (err) {
     log(`mnemon recall skipped: ${err instanceof Error ? err.message : String(err)}`);
-    return {};
   }
+
+  // The recall block is best-effort; the remember directive always rides along
+  // so the store keeps growing even on turns that surface no prior memory.
+  const additionalContext = [recalled, MNEMON_REMEMBER_DIRECTIVE].filter(Boolean).join('\n\n');
+
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext,
+    },
+  } as unknown as ReturnType<HookCallback>;
 };
 
 function createPreCompactHook(assistantName?: string): HookCallback {
