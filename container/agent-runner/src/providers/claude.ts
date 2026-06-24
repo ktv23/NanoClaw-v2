@@ -232,7 +232,16 @@ const userPromptSubmitHook: HookCallback = async (input) => {
     const { stdout } = await execFileAsync('mnemon', ['recall', prompt], {
       timeout: 8000,
       maxBuffer: 4 * 1024 * 1024,
-      env: process.env,
+      // Point mnemon's embedder at the host Ollama (published on the docker
+      // gateway) so recall ranks by meaning, not just shared keywords. mnemon's
+      // Ollama client ignores HTTP(S)_PROXY, so it reaches the gateway directly
+      // despite the OneCLI proxy. If Ollama is unreachable, recall transparently
+      // falls back to keyword/graph scoring — so this is safe on installs with
+      // no embedder. Host-side `mnemon embed` keeps stored vectors current.
+      env: {
+        ...process.env,
+        MNEMON_EMBED_ENDPOINT: process.env.MNEMON_EMBED_ENDPOINT || 'http://host.docker.internal:11434',
+      },
     });
     const results = (JSON.parse(stdout)?.results ?? []) as Array<{ content?: string; score?: number }>;
     const lines = results
