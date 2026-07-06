@@ -16,12 +16,27 @@ import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
-export interface McpServerConfig {
+/** Stdio MCP server — the SDK spawns `command` inside the agent container. */
+export interface McpStdioServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
   instructions?: string;
 }
+
+/**
+ * Remote MCP server over streamable HTTP or SSE — the SDK connects to `url`
+ * from inside the agent container (e.g. a host-side sidecar reached via
+ * `host.docker.internal`). `headers` carries auth (bearer tokens etc.).
+ */
+export interface McpRemoteServerConfig {
+  type: 'http' | 'sse';
+  url: string;
+  headers?: Record<string, string>;
+  instructions?: string;
+}
+
+export type McpServerConfig = McpStdioServerConfig | McpRemoteServerConfig;
 
 export interface AdditionalMountConfig {
   hostPath: string;

@@ -59,11 +59,11 @@ export interface QueryInput {
   };
 }
 
-export interface McpServerConfig {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
+/** Stdio (spawned in-container) or remote (http/sse) MCP server. Structurally
+ * a subset of the SDK's McpServerConfig union, so it passes through verbatim. */
+export type McpServerConfig =
+  | { type?: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
+  | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> };
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */

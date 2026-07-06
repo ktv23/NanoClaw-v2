@@ -9,13 +9,20 @@ import fs from 'fs';
 
 const CONFIG_PATH = '/workspace/agent/container.json';
 
+/** Stdio (spawned in-container) or remote (http/sse URL) MCP server entry.
+ * Mirrors the host's McpServerConfig in src/container-config.ts and is passed
+ * through verbatim to the provider SDK. */
+export type McpServerEntry =
+  | { command: string; args?: string[]; env?: Record<string, string> }
+  | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> };
+
 export interface RunnerConfig {
   provider: string;
   assistantName: string;
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  mcpServers: Record<string, McpServerEntry>;
   model?: string;
   effort?: string;
 }
