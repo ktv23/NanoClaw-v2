@@ -220,44 +220,64 @@ const MNEMON_REMEMBER_DIRECTIVE = [
   "Store at most the one or two most important items. Do NOT store: small talk, transient or operational state (what is/isn't running right now, errors, one-off task status), anything already in memory, or anything the user asked you not to keep. Run nothing when nothing durable came up.",
 ].join('\n');
 
+// Kingdom Death: Monster lookup trigger. Fires when a chat message body opens
+// with the `kdm` keyword (the formatter renders bodies as `...">kdm ...`, so we
+// match `>` immediately before the keyword — a plain `^kdm` never matches the
+// wrapped prompt). A hard, Bash-first instruction reliably injected per-turn
+// here, rather than as a static CLAUDE.local.md line the model tends to ignore.
+const KDM_TRIGGER_RE = />\s*kdm\b/i;
+
+const KDM_DIRECTIVE = [
+  'Kingdom Death: Monster lookup — this message opens with the `kdm` trigger, so it is a KDM rules/content question. You have a LOCAL offline copy of the KDM references on disk. You MUST answer from those files, looked up with the Bash tool — do NOT answer from your own training memory, and do NOT say you lack a KDM skill/tool. The files are just sitting on disk; read them.',
+  'Look it up now with Bash:',
+  '  grep -in "<term>" /app/skills/kingdom-death-wiki/official/*.md            # official rulings — highest authority',
+  '  grep -rli "<term>" /app/skills/kingdom-death-wiki/pages/ /app/skills/kingdom-death-wiki/fandom/pages/   # Miraheze + Fandom wikis',
+  'then read the best matches with cat / the Read tool. Monster stats & AI decks live in fandom/pages/; precise rules text in pages/ (exact tables in raw/*.xml); disputed rulings in official/. Full guide: /app/skills/kingdom-death-wiki/SKILL.md.',
+  'Answer ONLY from those files. If nothing matches, tell the user the archive does not cover it — do not guess. End with the source + URL, e.g. `Source: White Lion (Fandom) — https://kingdomdeath.fandom.com/wiki/White_Lion`, `Source: <Title> (Miraheze) — https://kingdomdeath.wiki/wiki/<Title>`, or `Source: Official Living Glossary`.',
+].join('\n');
+
 const userPromptSubmitHook: HookCallback = async (input) => {
-  const dataDir = process.env.MNEMON_DATA_DIR;
-  if (!dataDir) return {};
-
   const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
-  if (prompt.length < 3) return {};
 
+  // KDM archive trigger — independent of mnemon so it works on any install.
+  const kdmBlock = KDM_TRIGGER_RE.test(prompt) ? KDM_DIRECTIVE : '';
+
+  // mnemon recall + remember — only when mnemon is installed.
   let recalled = '';
-  try {
-    const { stdout } = await execFileAsync('mnemon', ['recall', prompt], {
-      timeout: 8000,
-      maxBuffer: 4 * 1024 * 1024,
-      // Point mnemon's embedder at the host Ollama (published on the docker
-      // gateway) so recall ranks by meaning, not just shared keywords. mnemon's
-      // Ollama client ignores HTTP(S)_PROXY, so it reaches the gateway directly
-      // despite the OneCLI proxy. If Ollama is unreachable, recall transparently
-      // falls back to keyword/graph scoring — so this is safe on installs with
-      // no embedder. Host-side `mnemon embed` keeps stored vectors current.
-      env: {
-        ...process.env,
-        MNEMON_EMBED_ENDPOINT: process.env.MNEMON_EMBED_ENDPOINT || 'http://host.docker.internal:11434',
-      },
-    });
-    const results = (JSON.parse(stdout)?.results ?? []) as Array<{ content?: string; score?: number }>;
-    const lines = results
-      .filter((r) => typeof r.content === 'string' && (r.score ?? 0) >= 0.25)
-      .slice(0, 8)
-      .map((r) => `- ${r.content}`);
-    if (lines.length > 0) {
-      recalled = `Relevant long-term memory (from your persistent memory store; use what's relevant, ignore what isn't):\n${lines.join('\n')}`;
+  let remember = '';
+  if (process.env.MNEMON_DATA_DIR && prompt.length >= 3) {
+    remember = MNEMON_REMEMBER_DIRECTIVE;
+    try {
+      const { stdout } = await execFileAsync('mnemon', ['recall', prompt], {
+        timeout: 8000,
+        maxBuffer: 4 * 1024 * 1024,
+        // Point mnemon's embedder at the host Ollama (published on the docker
+        // gateway) so recall ranks by meaning, not just shared keywords. mnemon's
+        // Ollama client ignores HTTP(S)_PROXY, so it reaches the gateway directly
+        // despite the OneCLI proxy. If Ollama is unreachable, recall transparently
+        // falls back to keyword/graph scoring — so this is safe on installs with
+        // no embedder. Host-side `mnemon embed` keeps stored vectors current.
+        env: {
+          ...process.env,
+          MNEMON_EMBED_ENDPOINT: process.env.MNEMON_EMBED_ENDPOINT || 'http://host.docker.internal:11434',
+        },
+      });
+      const results = (JSON.parse(stdout)?.results ?? []) as Array<{ content?: string; score?: number }>;
+      const lines = results
+        .filter((r) => typeof r.content === 'string' && (r.score ?? 0) >= 0.25)
+        .slice(0, 8)
+        .map((r) => `- ${r.content}`);
+      if (lines.length > 0) {
+        recalled = `Relevant long-term memory (from your persistent memory store; use what's relevant, ignore what isn't):\n${lines.join('\n')}`;
+      }
+    } catch (err) {
+      log(`mnemon recall skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
-  } catch (err) {
-    log(`mnemon recall skipped: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // The recall block is best-effort; the remember directive always rides along
-  // so the store keeps growing even on turns that surface no prior memory.
-  const additionalContext = [recalled, MNEMON_REMEMBER_DIRECTIVE].filter(Boolean).join('\n\n');
+  // KDM instruction first (most salient), then recall, then the remember nudge.
+  const additionalContext = [kdmBlock, recalled, remember].filter(Boolean).join('\n\n');
+  if (!additionalContext) return {};
 
   return {
     hookSpecificOutput: {
