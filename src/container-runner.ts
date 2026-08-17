@@ -465,6 +465,30 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
     : [];
 }
 
+/**
+ * Ensure `host.docker.internal` is exempt from the proxy env OneCLI injected.
+ * Remote MCP sidecars and other host-local endpoints (e.g. the Homestead MCP
+ * sidecar at the docker gateway) must be reached directly, not via the
+ * credential proxy. Merges into an existing `-e NO_PROXY=...` / `-e no_proxy=...`
+ * entry rather than clobbering what the gateway (or a provider contribution)
+ * set, or appends one when none is set. NanoClaw fork customization.
+ */
+export function ensureNoProxyHostGateway(args: string[]): void {
+  const HOST = 'host.docker.internal';
+  let found = false;
+  for (let i = 0; i + 1 < args.length; i++) {
+    if (args[i] !== '-e') continue;
+    const match = args[i + 1].match(/^(NO_PROXY|no_proxy)=(.*)$/);
+    if (!match) continue;
+    found = true;
+    const values = match[2] ? match[2].split(',') : [];
+    if (!values.includes(HOST)) {
+      args[i + 1] = `${match[1]}=${[...values, HOST].join(',')}`;
+    }
+  }
+  if (!found) args.push('-e', `NO_PROXY=${HOST}`);
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -544,6 +568,10 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // Exempt host-local endpoints (remote MCP sidecars, host Ollama) from the
+  // proxy env the gateway just injected. Merges into the gateway's NO_PROXY.
+  ensureNoProxyHostGateway(args);
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');

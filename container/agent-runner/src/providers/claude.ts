@@ -22,6 +22,69 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
+// Data-driven lookup-helper directives. Each mounted skill MAY ship a
+// `helper.json` at its root:
+//   { "trigger": "kdm", "directive": "…hard per-turn instructions…" }
+// When an inbound message matches a skill's trigger, that skill's directive is
+// injected into the turn (via UserPromptSubmit additionalContext — the reliable
+// lever; static CLAUDE.local.md lines get ignored). The trigger is matched after
+// the formatter's `>` wrapper, so a bare prefix like "kdm" becomes />\s*kdm\b/i;
+// an empty/absent trigger injects on every turn (dedicated always-on bots).
+//
+// This is a NanoClaw fork customization (KDM/MTG lookup helpers). It does NOT
+// collide with upstream's native memory hook or mnemon: both register
+// SessionStart *command* hooks in settings.json, while this is a programmatic
+// UserPromptSubmit hook passed to the SDK below.
+const SKILLS_DIR = process.env.SKILLS_DIR || '/app/skills';
+
+interface HelperDirective {
+  re: RegExp | null; // null => always inject
+  directive: string;
+}
+
+export function loadHelperDirectives(dir: string = SKILLS_DIR): HelperDirective[] {
+  const out: HelperDirective[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return out; // no skills dir (e.g. host-side tests) — nothing to inject
+  }
+  for (const name of entries) {
+    const p = `${dir}/${name}/helper.json`;
+    try {
+      if (!fs.existsSync(p)) continue;
+      const cfg = JSON.parse(fs.readFileSync(p, 'utf8')) as { trigger?: string; directive?: string };
+      if (!cfg.directive) continue;
+      const trigger = (cfg.trigger ?? '').trim();
+      const re = trigger
+        ? new RegExp('>\\s*' + trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i')
+        : null;
+      out.push({ re, directive: cfg.directive });
+    } catch (err) {
+      log(`helper.json load skipped for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return out;
+}
+
+// Loaded once per container — skills are read-only and mounted at spawn.
+const HELPER_DIRECTIVES = loadHelperDirectives();
+
+const helperUserPromptSubmitHook: HookCallback = async (input) => {
+  const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
+  // Lookup-helper directives (KDM, MTG, …) — driven by each skill's helper.json.
+  const helperBlocks = HELPER_DIRECTIVES.filter((h) => h.re === null || h.re.test(prompt)).map((h) => h.directive);
+  const additionalContext = helperBlocks.filter(Boolean).join('\n\n');
+  if (!additionalContext) return {};
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      additionalContext,
+    },
+  } as unknown as ReturnType<HookCallback>;
+};
+
 export interface SdkRateLimitInfo {
   status?: string;
   resetsAt?: number;
@@ -578,6 +641,7 @@ export class ClaudeProvider implements AgentProvider {
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+          UserPromptSubmit: [{ hooks: [helperUserPromptSubmitHook] }],
         },
       },
     });

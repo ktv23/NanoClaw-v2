@@ -103,7 +103,7 @@ ncl help
 
 | Resource | Verbs | What it is |
 |----------|-------|------------|
-| groups | list, get, create, update, delete, restart, config get/update, config add-mcp-server/remove-mcp-server, config add-package/remove-package | Agent groups (workspace, personality, container config) |
+| groups | list, get, create, update, delete, restart, config get/update, config add-mcp-server/remove-mcp-server, config add-package/remove-package, config set-skills/add-skill/remove-skill | Agent groups (workspace, personality, container config) |
 | messaging-groups | list, get, create, update, delete | A single chat/channel on one platform |
 | wirings | list, get, create, update, delete | Links a messaging group to an agent group (session mode, triggers) |
 | users | list, get, create, update | Platform identities (`<channel>:<handle>`) |
@@ -183,6 +183,12 @@ Approval-gating credentialed actions is a **two-sided** flow:
 - **Host-side** (nanoclaw): receives pending approvals and routes them to a human. `src/modules/approvals/onecli-approvals.ts` registers a callback via `onecli.configureManualApproval(cb)` (long-polls `GET /api/approvals/pending`). The callback uses `pickApprover` + `pickApprovalDelivery` from `src/modules/approvals/primitive.ts` to DM an approver. Approvers are resolved from the `user_roles` table — preference order: scoped admins for the agent group → global admins → owners. There is no env var like `NANOCLAW_ADMIN_USER_IDS`; roles are persisted in the central DB only.
 
 If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
+
+### Gotcha: Google OAuth rejects private-IP redirect URIs
+
+OneCLI's `~/.onecli/docker-compose.yml` defaults `APP_URL` / `NEXT_PUBLIC_APP_URL` to a private-IP host (e.g. `http://172.17.0.1:10254`). That URL becomes the OAuth callback when you Connect a Google app (Gmail, Calendar, Drive) in the web UI, and **Google blocks private-IP addresses in `redirect_uri` for Desktop-app OAuth clients** — only `localhost`/`127.0.0.1` are accepted. The Connect flow fails with `Error 400: invalid_request … device_id and device_name are required for private IP`.
+
+Fix: hardcode `APP_URL` and `NEXT_PUBLIC_APP_URL` to `http://localhost:10254` in the compose file (leave the port binding on the gateway IP so containers still reach the gateway), then `cd ~/.onecli && docker compose up -d onecli`. Browser access uses an SSH tunnel: `ssh -N -L 10254:172.17.0.1:10254 <user>@<host>` → open `http://localhost:10254`. Relevant when reconnecting Gmail/Calendar after `/add-gmail-tool` + `/add-gcal-tool`.
 
 ## Skills
 
@@ -277,6 +283,17 @@ This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspac
 - **`minimumReleaseAgeExclude`**: Never add entries without human sign-off. If a package must bypass the release age gate, the human must approve and the entry must pin the exact version being excluded (e.g. `package@1.2.3`), never a range.
 - **`onlyBuiltDependencies`**: Never add packages to this list without human approval — build scripts execute arbitrary code during install.
 - **`pnpm install --frozen-lockfile`** should be used in CI, automation, and container builds. Never run bare `pnpm install` in those contexts.
+
+## Fork customizations
+
+This is a personal fork (Nova + the KDM/MTG Telegram helper bot). Changes on top of upstream, reapplied via `/migrate-nanoclaw` (`.nanoclaw-migrations/`):
+
+- **Lookup-helper directives** — `container/agent-runner/src/providers/claude.ts` loads a `helper.json` (`{ "trigger": "kdm", "directive": "…" }`) from each mounted skill and injects the matching skill's hard per-turn directive via a programmatic `UserPromptSubmit` hook (`loadHelperDirectives` + `helperUserPromptSubmitHook`). Data-driven, no per-game code; the `helper.json` + corpora are laid down by `forge deploy` from the `helper-forge` project (KDM data off-GitHub). Does not collide with upstream's native memory/mnemon hooks (those are SessionStart *command* hooks).
+- **NO_PROXY host-local exemption** — `ensureNoProxyHostGateway(args)` in `src/container-runner.ts` (called after the OneCLI gateway wiring) exempts `host.docker.internal` from the injected proxy env so host-local endpoints (the Homestead remote-MCP sidecar, host Ollama) are reached directly. Test: `src/no-proxy-merge.test.ts`.
+- **config-skills verbs** — `ncl groups config set-skills | add-skill | remove-skill` manage the `skills` mount list (`src/cli/resources/skills-util.ts` + `groups.ts`). `forge deploy` relies on `add-skill` being an idempotent no-op when the group mounts `'all'`.
+- **pdf-reader container skill** — `container/skills/pdf-reader/` (poppler-utils `pdftotext`/`pdfinfo` wrapper). poppler-utils is provided per-agent-group via container-config apt packages, not the base image.
+
+Installed capabilities carried on the fork: Telegram channel (`/add-telegram`), Gmail + Calendar tools (`/add-gmail-tool`, `/add-gcal-tool` — MCP servers in `container/cli-tools.json`), mnemon memory (`/add-mnemon`).
 
 ## Docs Index
 

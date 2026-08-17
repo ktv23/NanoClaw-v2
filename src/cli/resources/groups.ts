@@ -30,6 +30,7 @@ import { isValidTimezone } from '../../timezone.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { localizeIsoTimestamps } from '../format.js';
+import { parseSkillsArg, addSkill, removeSkill, type Skills } from './skills-util.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
@@ -567,6 +568,60 @@ registerResource({
         const filtered = existing.filter((m) => !(m.hostPath === hostPath && m.containerPath === containerPath));
         updateContainerConfigJson(id, 'additional_mounts', filtered);
         return { removed: { hostPath, containerPath }, note: `Run \`ncl groups restart --id ${id}\` to apply.` };
+      },
+    },
+    'config set-skills': {
+      access: 'approval',
+      description:
+        'Set the exact skills a group mounts. Requires `ncl groups restart --rebuild` to take effect. ' +
+        'Use --id <group-id> and --skills all (mount every skill) or --skills "a,b,c" (or a JSON array) ' +
+        'to mount exactly those.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        if (args.skills === undefined)
+          throw new Error('--skills is required (use "all", a comma-separated list, or a JSON array)');
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+        const value = parseSkillsArg(String(args.skills));
+        updateContainerConfigJson(id, 'skills', value);
+        return { skills: value, note: 'Run `ncl groups restart --rebuild` to remount.' };
+      },
+    },
+    'config add-skill': {
+      access: 'approval',
+      description:
+        "Add a skill to a group's mount list. Requires `ncl groups restart --rebuild` to take effect. " +
+        'Use --id <group-id> --skill <skill-name>. If the group mounts "all" skills, the skill is already ' +
+        'included (no-op).',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const skill = args.skill as string;
+        if (!skill) throw new Error('--skill is required');
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+        const result = addSkill(JSON.parse(row.skills) as Skills, skill);
+        if (result.added) updateContainerConfigJson(id, 'skills', result.skills);
+        return result;
+      },
+    },
+    'config remove-skill': {
+      access: 'approval',
+      description:
+        "Remove a skill from a group's mount list. Requires `ncl groups restart --rebuild` to take effect. " +
+        'Use --id <group-id> --skill <skill-name>. Not valid when the group mounts "all" — use ' +
+        '`config set-skills` to pin an explicit list first.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const skill = args.skill as string;
+        if (!skill) throw new Error('--skill is required');
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+        const result = removeSkill(JSON.parse(row.skills) as Skills, skill);
+        updateContainerConfigJson(id, 'skills', result.skills);
+        return { ...result, note: 'Run `ncl groups restart --rebuild` to remount.' };
       },
     },
   },
