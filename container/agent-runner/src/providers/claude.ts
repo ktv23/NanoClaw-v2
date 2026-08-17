@@ -234,6 +234,7 @@ const KDM_DIRECTIVE = [
   '  grep -rli "<term>" /app/skills/kingdom-death-wiki/pages/ /app/skills/kingdom-death-wiki/fandom/pages/   # Miraheze + Fandom wikis',
   'then read the best matches with cat / the Read tool. Monster stats & AI decks live in fandom/pages/; precise rules text in pages/ (exact tables in raw/*.xml); disputed rulings in official/. Full guide: /app/skills/kingdom-death-wiki/SKILL.md.',
   'Answer ONLY from those files. If nothing matches, tell the user the archive does not cover it — do not guess. End with the source + URL, e.g. `Source: White Lion (Fandom) — https://kingdomdeath.fandom.com/wiki/White_Lion`, `Source: <Title> (Miraheze) — https://kingdomdeath.wiki/wiki/<Title>`, or `Source: Official Living Glossary`.',
+  'CRITICAL — after you have looked things up, you MUST DELIVER your answer through the normal reply mechanism: wrap the whole answer in a `<message to="...">` block addressed to the channel you were messaged from (per your runtime system prompt). Grep/read output and reasoning are NOT sent to the user — only text inside a `<message to="...">` block reaches them. Do not end your turn with the answer as plain text; if you do, nothing is sent and the user sees silence.',
 ].join('\n');
 
 const userPromptSubmitHook: HookCallback = async (input) => {
