@@ -225,23 +225,58 @@ const MNEMON_REMEMBER_DIRECTIVE = [
 // match `>` immediately before the keyword — a plain `^kdm` never matches the
 // wrapped prompt). A hard, Bash-first instruction reliably injected per-turn
 // here, rather than as a static CLAUDE.local.md line the model tends to ignore.
-const KDM_TRIGGER_RE = />\s*kdm\b/i;
+// Data-driven lookup-helper directives. Each mounted skill MAY ship a
+// `helper.json` at its root:
+//   { "trigger": "kdm", "directive": "…hard per-turn instructions…" }
+// When an inbound message matches a skill's trigger, that skill's directive is
+// injected into the turn (via UserPromptSubmit additionalContext — the reliable
+// lever; static CLAUDE.local.md lines get ignored). The trigger is matched after
+// the formatter's `>` wrapper, so a bare prefix like "kdm" becomes />\s*kdm\b/i;
+// an empty/absent trigger injects on every turn (dedicated always-on bots).
+// This replaces per-game hardcoding: a new lookup bot is just a skill folder
+// with a helper.json — no code change here.
+const SKILLS_DIR = process.env.SKILLS_DIR || '/app/skills';
 
-const KDM_DIRECTIVE = [
-  'Kingdom Death: Monster lookup — this message opens with the `kdm` trigger, so it is a KDM rules/content question. You have a LOCAL offline copy of the KDM references on disk. You MUST answer from those files, looked up with the Bash tool — do NOT answer from your own training memory, and do NOT say you lack a KDM skill/tool. The files are just sitting on disk; read them.',
-  'Look it up now with Bash:',
-  '  grep -in "<term>" /app/skills/kingdom-death-wiki/official/*.md            # official rulings — highest authority',
-  '  grep -rli "<term>" /app/skills/kingdom-death-wiki/pages/ /app/skills/kingdom-death-wiki/fandom/pages/   # Miraheze + Fandom wikis',
-  'then read the best matches with cat / the Read tool. Monster stats & AI decks live in fandom/pages/; precise rules text in pages/ (exact tables in raw/*.xml); disputed rulings in official/. Full guide: /app/skills/kingdom-death-wiki/SKILL.md.',
-  'Answer ONLY from those files. If nothing matches, tell the user the archive does not cover it — do not guess. End with the source + URL, e.g. `Source: White Lion (Fandom) — https://kingdomdeath.fandom.com/wiki/White_Lion`, `Source: <Title> (Miraheze) — https://kingdomdeath.wiki/wiki/<Title>`, or `Source: Official Living Glossary`.',
-  'CRITICAL — after you have looked things up, you MUST DELIVER your answer through the normal reply mechanism: wrap the whole answer in a `<message to="...">` block addressed to the channel you were messaged from (per your runtime system prompt). Grep/read output and reasoning are NOT sent to the user — only text inside a `<message to="...">` block reaches them. Do not end your turn with the answer as plain text; if you do, nothing is sent and the user sees silence.',
-].join('\n');
+interface HelperDirective {
+  re: RegExp | null; // null => always inject
+  directive: string;
+}
+
+export function loadHelperDirectives(dir: string = SKILLS_DIR): HelperDirective[] {
+  const out: HelperDirective[] = [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return out; // no skills dir (e.g. host-side tests) — nothing to inject
+  }
+  for (const name of entries) {
+    const p = `${dir}/${name}/helper.json`;
+    try {
+      if (!fs.existsSync(p)) continue;
+      const cfg = JSON.parse(fs.readFileSync(p, 'utf8')) as { trigger?: string; directive?: string };
+      if (!cfg.directive) continue;
+      const trigger = (cfg.trigger ?? '').trim();
+      const re = trigger
+        ? new RegExp('>\\s*' + trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i')
+        : null;
+      out.push({ re, directive: cfg.directive });
+    } catch (err) {
+      log(`helper.json load skipped for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return out;
+}
+
+// Loaded once per container — skills are read-only and mounted at spawn.
+const HELPER_DIRECTIVES = loadHelperDirectives();
 
 const userPromptSubmitHook: HookCallback = async (input) => {
   const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
 
-  // KDM archive trigger — independent of mnemon so it works on any install.
-  const kdmBlock = KDM_TRIGGER_RE.test(prompt) ? KDM_DIRECTIVE : '';
+  // Lookup-helper directives (KDM, MTG, …) — driven by each skill's helper.json,
+  // independent of mnemon so they work on any install.
+  const helperBlocks = HELPER_DIRECTIVES.filter((h) => h.re === null || h.re.test(prompt)).map((h) => h.directive);
 
   // mnemon recall + remember — only when mnemon is installed.
   let recalled = '';
@@ -276,8 +311,8 @@ const userPromptSubmitHook: HookCallback = async (input) => {
     }
   }
 
-  // KDM instruction first (most salient), then recall, then the remember nudge.
-  const additionalContext = [kdmBlock, recalled, remember].filter(Boolean).join('\n\n');
+  // Helper directives first (most salient), then recall, then the remember nudge.
+  const additionalContext = [...helperBlocks, recalled, remember].filter(Boolean).join('\n\n');
   if (!additionalContext) return {};
 
   return {
