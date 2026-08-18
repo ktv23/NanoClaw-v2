@@ -26,11 +26,20 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
+import { loadGate, promptHasAllowedTrigger } from './gatekeeper.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+/**
+ * Hard game-lookup gate, resolved once from the mounted skills at startup
+ * (skills are a read-only mount fixed for the container's life). Null unless an
+ * enforcing "gatekeeper" skill is mounted — so this is inert for every bot
+ * except a locked lookup bot. See ./gatekeeper.ts.
+ */
+const GATEKEEPER = loadGate();
 
 /**
  * Number of consecutive `database disk image is malformed` errors after which
@@ -237,6 +246,30 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+
+    // MODULE-HOOK:gatekeeper:start
+    // Hard game-lookup gate. When an enforcing gatekeeper skill is mounted and
+    // this user-chat turn carries no allowed game trigger, deliver the fallback
+    // usage card and end the turn WITHOUT calling the provider — the model can
+    // never produce a generic answer for a code-less message. Restricted to
+    // user chat so tasks/webhooks/system messages pass straight through.
+    if (GATEKEEPER && keep.every((m) => m.kind === 'chat' || m.kind === 'chat-sdk')) {
+      if (!promptHasAllowedTrigger(prompt, GATEKEEPER.allowedTriggers)) {
+        writeMessageOut({
+          id: generateId(),
+          in_reply_to: routing.inReplyTo,
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: GATEKEEPER.fallbackMessage }),
+        });
+        markCompleted(keep.map((m) => m.id));
+        log(`Gatekeeper: no game trigger in turn — sent usage card, skipped query`);
+        continue;
+      }
+    }
+    // MODULE-HOOK:gatekeeper:end
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
