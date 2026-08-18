@@ -78,6 +78,11 @@ describe('promptHasAllowedTrigger', () => {
     expect(promptHasAllowedTrigger('> MTG flying rules', triggers)).toBe(true);
   });
 
+  it('matches past a leading escaped Discord @mention (mention mode)', () => {
+    const body = '<message sender="kinkouin">&lt;@1539002280878014484&gt; mtg how do I make a croquet monsieur</message>';
+    expect(promptHasAllowedTrigger(body, triggers)).toBe(true);
+  });
+
   it('does not match a code-less turn', () => {
     expect(promptHasAllowedTrigger('> hello there', triggers)).toBe(false);
     expect(promptHasAllowedTrigger('>', triggers)).toBe(false);

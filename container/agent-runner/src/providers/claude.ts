@@ -7,6 +7,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
+import { triggerRegex } from '../trigger-match.js';
 import { shimCwd } from './cwd-shim.js';
 import { registerProvider } from './provider-registry.js';
 import type {
@@ -57,9 +58,10 @@ export function loadHelperDirectives(dir: string = SKILLS_DIR): HelperDirective[
       const cfg = JSON.parse(fs.readFileSync(p, 'utf8')) as { trigger?: string; directive?: string };
       if (!cfg.directive) continue;
       const trigger = (cfg.trigger ?? '').trim();
-      const re = trigger
-        ? new RegExp('>\\s*' + trigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i')
-        : null;
+      // Shared matcher tolerates a leading platform @mention (Discord mention
+      // mode renders `<@id>` into the escaped body before the code); a naive
+      // `>\s*<trigger>` would never fire for a mention-mode message.
+      const re = trigger ? triggerRegex(trigger) : null;
       out.push({ re, directive: cfg.directive });
     } catch (err) {
       log(`helper.json load skipped for ${name}: ${err instanceof Error ? err.message : String(err)}`);

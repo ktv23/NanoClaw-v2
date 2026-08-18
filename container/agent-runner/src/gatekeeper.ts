@@ -23,6 +23,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { triggerRegex } from './trigger-match.js';
+
 const SKILLS_DIR = '/app/skills';
 
 export interface GateConfig {
@@ -66,14 +68,13 @@ export function loadGate(dir: string = SKILLS_DIR): GateConfig | null {
 
 /**
  * True when the formatted prompt opens with one of the allowed game triggers.
- * Mirrors the directive-injection match in providers/claude.ts exactly
- * (`>\s*<trigger>\b`, case-insensitive) so the gate and the per-game directive
- * always agree on what counts as a game turn: if this returns true the game's
- * directive was injected; if false the gate blocks and the model never runs.
+ * Uses the SHARED trigger matcher (./trigger-match.ts) — the exact same matcher
+ * providers/claude.ts uses to inject a game's directive — so the gate and the
+ * per-game directive always agree: if this returns true the game's directive was
+ * injected; if false the gate blocks and the model never runs. The shared
+ * matcher tolerates a leading platform @mention (Discord mention mode), which a
+ * naive `>\s*<trigger>` would miss.
  */
 export function promptHasAllowedTrigger(prompt: string, allowedTriggers: string[]): boolean {
-  return allowedTriggers.some((t) => {
-    const esc = t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp('>\\s*' + esc + '\\b', 'i').test(prompt);
-  });
+  return allowedTriggers.some((t) => triggerRegex(t).test(prompt));
 }
