@@ -7,7 +7,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
-import { triggerRegex } from '../trigger-match.js';
+import { triggerRegex, currentTurnText } from '../trigger-match.js';
 import { shimCwd } from './cwd-shim.js';
 import { registerProvider } from './provider-registry.js';
 import type {
@@ -76,7 +76,12 @@ const HELPER_DIRECTIVES = loadHelperDirectives();
 const helperUserPromptSubmitHook: HookCallback = async (input) => {
   const prompt = ((input as { prompt?: string }).prompt ?? '').trim();
   // Lookup-helper directives (KDM, MTG, …) — driven by each skill's helper.json.
-  const helperBlocks = HELPER_DIRECTIVES.filter((h) => h.re === null || h.re.test(prompt)).map((h) => h.directive);
+  // Match against the CURRENT turn (last message block), NOT the whole prompt:
+  // a game code in an earlier context message must not inject that game's
+  // directive for a code-less current message. Mirrors the gate (gatekeeper.ts)
+  // so injection and gate always agree. See trigger-match.currentTurnText.
+  const turn = currentTurnText(prompt);
+  const helperBlocks = HELPER_DIRECTIVES.filter((h) => h.re === null || h.re.test(turn)).map((h) => h.directive);
   const additionalContext = helperBlocks.filter(Boolean).join('\n\n');
   if (!additionalContext) return {};
   return {

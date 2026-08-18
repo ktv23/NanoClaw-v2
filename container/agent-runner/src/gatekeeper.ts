@@ -23,7 +23,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { triggerRegex } from './trigger-match.js';
+import { matchesAnyTrigger } from './trigger-match.js';
 
 const SKILLS_DIR = '/app/skills';
 
@@ -67,14 +67,15 @@ export function loadGate(dir: string = SKILLS_DIR): GateConfig | null {
 }
 
 /**
- * True when the formatted prompt opens with one of the allowed game triggers.
+ * True when the CURRENT message opens with one of the allowed game triggers.
  * Uses the SHARED trigger matcher (./trigger-match.ts) — the exact same matcher
  * providers/claude.ts uses to inject a game's directive — so the gate and the
  * per-game directive always agree: if this returns true the game's directive was
  * injected; if false the gate blocks and the model never runs. The shared
- * matcher tolerates a leading platform @mention (Discord mention mode), which a
- * naive `>\s*<trigger>` would miss.
+ * matcher tolerates a leading platform @mention (Discord mention mode) and
+ * scopes to the current turn's message block, so an earlier context message's
+ * game code cannot leak the classification onto a code-less current message.
  */
 export function promptHasAllowedTrigger(prompt: string, allowedTriggers: string[]): boolean {
-  return allowedTriggers.some((t) => triggerRegex(t).test(prompt));
+  return matchesAnyTrigger(prompt, allowedTriggers);
 }

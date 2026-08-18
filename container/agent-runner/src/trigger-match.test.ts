@@ -7,7 +7,7 @@
  */
 import { describe, it, expect } from 'bun:test';
 
-import { triggerRegex, matchesAnyTrigger } from './trigger-match.js';
+import { triggerRegex, matchesAnyTrigger, currentTurnText } from './trigger-match.js';
 
 // How formatter.formatSingleChat renders a chat message (escaped body).
 function fmt(bodyText: string): string {
@@ -17,6 +17,12 @@ function fmt(bodyText: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
   return `<message id="5" from="discord-tonys" sender="kinkouin" time="4:39 PM">${esc}</message>`;
+}
+
+// A multi-message prompt (getPendingMessages merges context + current, formatted
+// oldest-first); the CURRENT message is the last block.
+function convo(...bodies: string[]): string {
+  return bodies.map(fmt).join('');
 }
 
 describe('triggerRegex', () => {
@@ -64,5 +70,37 @@ describe('matchesAnyTrigger', () => {
 
   it('is false for a code-less mention', () => {
     expect(matchesAnyTrigger(fmt('<@1> how do I not get bodied?'), triggers)).toBe(false);
+  });
+
+  // The Ambassador-Blorpityblorpboob incident: a code-less current message that
+  // arrives after mtg-coded traffic must NOT inherit the mtg classification.
+  it('REGRESSION: a code in an EARLIER context block does not leak onto a code-less current message', () => {
+    const prompt = convo(
+      '<@1> mtg show me a full legend of every mana symbol',
+      '<@1> mtg what does Liliana, Dreadhorde General do?',
+      '<@1> what does Ambassador Blorpityblorpboob do?', // current: no code
+    );
+    expect(matchesAnyTrigger(prompt, triggers)).toBe(false);
+  });
+
+  it('matches when the CURRENT (last) block carries the code, even after code-less context', () => {
+    const prompt = convo(
+      '<@1> just chatting about nothing',
+      '<@1> mtg what does Ambassador Blorpityblorpboob do?', // current: coded
+    );
+    expect(matchesAnyTrigger(prompt, triggers)).toBe(true);
+  });
+});
+
+describe('currentTurnText', () => {
+  it('returns the last message block of a multi-message prompt', () => {
+    const prompt = convo('mtg first question', 'kdm second question');
+    const turn = currentTurnText(prompt);
+    expect(turn.includes('second question')).toBe(true);
+    expect(turn.includes('first question')).toBe(false);
+  });
+
+  it('returns the whole string when there is no message block (bare body)', () => {
+    expect(currentTurnText('mtg bare text')).toBe('mtg bare text');
   });
 });

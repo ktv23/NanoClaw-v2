@@ -97,4 +97,21 @@ describe('promptHasAllowedTrigger', () => {
   it('returns false when there are no allowed triggers', () => {
     expect(promptHasAllowedTrigger('> mtg anything', [])).toBe(false);
   });
+
+  // Gate must be per-message: a code-less current message that rides along with
+  // earlier mtg-coded context blocks (getPendingMessages merge) must still be
+  // blocked. This is the Ambassador-Blorpityblorpboob incident.
+  it('REGRESSION: blocks a code-less current message despite an earlier mtg context block', () => {
+    const prompt =
+      '<message sender="a">&lt;@1&gt; mtg what does Liliana do?</message>' +
+      '<message sender="b">&lt;@1&gt; what does Ambassador Blorpityblorpboob do?</message>';
+    expect(promptHasAllowedTrigger(prompt, triggers)).toBe(false);
+  });
+
+  it('still passes when the current message itself carries the code', () => {
+    const prompt =
+      '<message sender="a">&lt;@1&gt; just chatting</message>' +
+      '<message sender="b">&lt;@1&gt; mtg what does Ambassador Blorpityblorpboob do?</message>';
+    expect(promptHasAllowedTrigger(prompt, triggers)).toBe(true);
+  });
 });
