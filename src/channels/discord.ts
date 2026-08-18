@@ -5,7 +5,8 @@
 import { createDiscordAdapter } from '@chat-adapter/discord';
 
 import { readEnvFile } from '../env.js';
-import type { ChannelDefaults } from './adapter.js';
+import { log } from '../log.js';
+import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -82,10 +83,11 @@ registerChannelAdapter('discord', {
       applicationId: env.DISCORD_APPLICATION_ID,
     });
     unwrapForwards(discordAdapter);
-    return createChatSdkBridge({
+    const token = env.DISCORD_BOT_TOKEN;
+    const bridge = createChatSdkBridge({
       adapter: discordAdapter,
       concurrency: 'concurrent',
-      botToken: env.DISCORD_BOT_TOKEN,
+      botToken: token,
       extractReplyContext,
       supportsThreads: true,
       defaults: DISCORD_DEFAULTS,
@@ -93,6 +95,38 @@ registerChannelAdapter('discord', {
       // would let long agent replies fail instead of splitting them.
       maxTextLength: 2000,
     });
+
+    // Give bot-spawned threads a meaningful name. When the agent is @mentioned
+    // in a group channel (threads:on), Discord opens a thread auto-named
+    // "Thread <timestamp>". The router fires this once, on the new per-thread
+    // session, with a title derived from the triggering message. We rename ONLY
+    // that auto-generated name — never a thread a human titled deliberately.
+    const wrapped: ChannelAdapter = {
+      ...bridge,
+      setThreadTitle: async (_platformId: string, threadId: string, title: string): Promise<void> => {
+        const snowflake = threadId.split(':').pop();
+        const name = title.trim().slice(0, 90);
+        if (!snowflake || !name) return;
+        try {
+          const res = await fetch(`https://discord.com/api/v10/channels/${snowflake}`, {
+            headers: { Authorization: `Bot ${token}` },
+          });
+          if (!res.ok) return;
+          const chan = (await res.json()) as { name?: string };
+          // Only auto-generated thread names ("Thread 8/18/2026, 8:28 AM") get
+          // renamed; a user-named thread (e.g. "Helldivers play KDM") is left alone.
+          if (!chan.name || !/^Thread\b/i.test(chan.name)) return;
+          await fetch(`https://discord.com/api/v10/channels/${snowflake}`, {
+            method: 'PATCH',
+            headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+          });
+        } catch (err) {
+          log.warn('discord setThreadTitle failed', { threadId, err });
+        }
+      },
+    };
+    return wrapped;
   },
   defaults: DISCORD_DEFAULTS,
 });

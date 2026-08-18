@@ -17,7 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
-import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
+import { getChannelAdapter, getChannelDefaults, setThreadTitle } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -498,6 +498,27 @@ function evaluateEngage(
   }
 }
 
+/**
+ * A concise thread name from the message that spawned the thread: the message
+ * text with Discord mention tokens stripped and whitespace collapsed, capped to
+ * Discord's title budget. Empty (e.g. an attachment-only message) → no rename.
+ */
+function deriveThreadTitle(content: string): string {
+  let text = content;
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown };
+    if (typeof parsed.text === 'string') text = parsed.text;
+  } catch {
+    // content is not JSON — use it verbatim
+  }
+  return text
+    .replace(/<@!?\d+>/g, ' ') // <@123> / <@!123> mention tokens
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 90)
+    .trim();
+}
+
 async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
@@ -520,6 +541,17 @@ async function deliverToAgent(
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
+
+  // Name a freshly-spawned thread after the message that started it. Fire-and-
+  // forget — a rename must never block or fail delivery; the adapter no-ops on
+  // human-named threads and platforms without a thread-title concept.
+  if (created && effectiveThreadId && effectiveSessionMode === 'per-thread' && mg.is_group !== 0) {
+    const title = deriveThreadTitle(event.message.content);
+    if (title) {
+      const channelKey = mg.instance ?? mg.channel_type;
+      void setThreadTitle(channelKey, event.platformId, effectiveThreadId, title).catch(() => {});
+    }
+  }
 
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
