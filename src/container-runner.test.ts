@@ -1,8 +1,15 @@
 import fs from 'fs';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { hardeningArgs, resolveProviderName } from './container-runner.js';
+import os from 'os';
+
+import {
+  hardeningArgs,
+  resolveProviderName,
+  selectedSkillNames,
+  skillEnforcesLockdown,
+} from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -44,6 +51,71 @@ describe('buildContainerArgs ordering invariant (structural)', () => {
     expect(mountsLoop).toBeGreaterThan(-1);
     expect(gatewayApply).toBeGreaterThan(-1);
     expect(gatewayApply).toBeGreaterThan(mountsLoop);
+  });
+});
+
+describe('skillEnforcesLockdown', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeHelper(cfg: unknown): void {
+    fs.writeFileSync(path.join(dir, 'helper.json'), JSON.stringify(cfg));
+  }
+
+  it('is true when helper.json declares enforce:true', () => {
+    writeHelper({ trigger: '', enforce: true, fallback_message: 'card' });
+    expect(skillEnforcesLockdown(dir)).toBe(true);
+  });
+
+  it('is false for a normal game helper (enforce absent)', () => {
+    writeHelper({ trigger: 'mtg', directive: 'x' });
+    expect(skillEnforcesLockdown(dir)).toBe(false);
+  });
+
+  it('fails open (false) for a missing or malformed helper.json', () => {
+    expect(skillEnforcesLockdown(dir)).toBe(false); // no helper.json
+    fs.writeFileSync(path.join(dir, 'helper.json'), '{ not json');
+    expect(skillEnforcesLockdown(dir)).toBe(false);
+  });
+});
+
+describe('selectedSkillNames', () => {
+  it('returns an explicit list verbatim — an explicitly listed gatekeeper is kept', () => {
+    const skills = ['kingdom-death-wiki', 'mtg-helper', 'gatekeeper'];
+    expect(selectedSkillNames({ skills } as never)).toEqual(skills);
+  });
+
+  it("'all' excludes enforcing lockdown skills so a personal assistant never inherits the gate", () => {
+    // Fixture skills tree under a temp cwd: two normal helpers + one gatekeeper.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-'));
+    const skillsDir = path.join(root, 'container', 'skills');
+    fs.mkdirSync(path.join(skillsDir, 'mtg-helper'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillsDir, 'mtg-helper', 'helper.json'),
+      JSON.stringify({ trigger: 'mtg', directive: 'x' }),
+    );
+    fs.mkdirSync(path.join(skillsDir, 'agent-browser'), { recursive: true }); // no helper.json
+    fs.mkdirSync(path.join(skillsDir, 'gatekeeper'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillsDir, 'gatekeeper', 'helper.json'),
+      JSON.stringify({ trigger: '', enforce: true, fallback_message: 'card' }),
+    );
+
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const resolved = selectedSkillNames({ skills: 'all' } as never).sort();
+      expect(resolved).toEqual(['agent-browser', 'mtg-helper']);
+      expect(resolved).not.toContain('gatekeeper');
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

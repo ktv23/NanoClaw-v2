@@ -15,17 +15,25 @@
  * never emit a generic reply for a code-less message.
  *
  * Data-driven and self-scoping:
- *  - active only in containers that mount an enforcing gatekeeper skill, so a
- *    personal assistant (which mounts none) is unaffected;
- *  - the allow-list is collected from every mounted helper.json's non-empty
+ *  - active only in containers whose GROUP SELECTED an enforcing gatekeeper skill,
+ *    so a personal assistant (which selects none) is unaffected;
+ *  - the allow-list is collected from every SELECTED helper.json's non-empty
  *    trigger, so adding a game helper automatically widens it — no code change.
+ *
+ * Scoping note: the whole `container/skills/` tree is mounted read-only at
+ * `/app/skills` in every container regardless of selection, so reading that path
+ * would fire the gate for ANY container as long as a gatekeeper skill exists in
+ * the shared tree (this is exactly how the gate leaked onto a personal assistant
+ * that mounted `skills: 'all'`). The group's ACTUAL selection is the symlink set
+ * the host syncs into `/home/node/.claude/skills/` (each `<name>` → the shared
+ * `/app/skills/<name>`), so that is what we read.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 
 import { matchesAnyTrigger } from './trigger-match.js';
 
-const SKILLS_DIR = '/app/skills';
+const SKILLS_DIR = '/home/node/.claude/skills';
 
 export interface GateConfig {
   /** Non-empty triggers across all mounted helper.json (kdm, mtg, …). */

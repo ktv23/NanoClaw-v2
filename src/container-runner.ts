@@ -450,19 +450,41 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
 /**
  * Resolve the group's skill selection to concrete names — `'all'` recomputes
  * from `container/skills/` so newly-added upstream skills appear automatically.
+ *
+ * `'all'` deliberately EXCLUDES enforcing lockdown skills (a helper.json with
+ * `"enforce": true`, e.g. the game-lookup gatekeeper). Such a skill turns a bot
+ * into a locked reference bot that answers nothing outside its allow-list, so it
+ * must be opt-in — explicitly listed — never inherited by a general-purpose
+ * assistant that happens to mount `'all'`. (NanoClaw fork: lookup-bot gatekeeper.)
  */
-function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
+export function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
   if (containerConfig.skills !== 'all') return containerConfig.skills;
   const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
   return fs.existsSync(sharedSkillsDir)
     ? fs.readdirSync(sharedSkillsDir).filter((e) => {
+        const dir = path.join(sharedSkillsDir, e);
         try {
-          return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
+          if (!fs.statSync(dir).isDirectory()) return false;
         } catch {
           return false;
         }
+        return !skillEnforcesLockdown(dir);
       })
     : [];
+}
+
+/**
+ * True when a skill directory declares an enforcing lockdown gatekeeper
+ * (`helper.json` `"enforce": true`). Read defensively — a missing or malformed
+ * helper.json means "not a lockdown", so the skill is included by `'all'`.
+ */
+export function skillEnforcesLockdown(skillDir: string): boolean {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(skillDir, 'helper.json'), 'utf8'));
+    return cfg?.enforce === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
