@@ -7,6 +7,8 @@
  *   - Tracks delivery in inbound.db's `delivered` table (host-owned)
  *   - Never writes to outbound.db — preserves single-writer-per-file invariant
  */
+import fs from 'fs';
+
 import type Database from 'better-sqlite3';
 
 import {
@@ -37,7 +39,16 @@ import { isUnguarded, type Unguarded } from './guard/index.js';
 import { fanOutboundMessage } from './modules/cross-session-context/index.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
+import {
+  clearOutbox,
+  heartbeatPath,
+  openInboundDb,
+  openOutboundDb,
+  readOutboxFiles,
+  writeOutboundDirect,
+  writeSessionMessage,
+} from './session-manager.js';
+import { wakeContainer } from './container-runner.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { PendingApproval, Session } from './types.js';
@@ -67,6 +78,23 @@ function deliveryBackoffMs(attempts: number): number {
  * hammering the channel every ~1s poll tick.
  */
 const deliveryAttempts = new Map<string, { attempts: number; nextAttemptAt: number }>();
+
+// Interim "still working" feedback: if a user's turn has been open this long
+// with no reply and the container is still alive, send one nudge so the chat
+// isn't just silent. 30s sits above Nova's median turn (~19s) so normal turns
+// never trigger it — only the genuinely slow tail. Tune here (could become a
+// per-agent-group setting later).
+const INTERIM_FEEDBACK_MS = 30_000;
+const INTERIM_HEARTBEAT_FRESH_MS = 15_000;
+const INTERIM_TEXT = "⏳ Still on it — this one's taking a bit, hang tight.";
+/** sessionId → inbound id we've already nudged for (one nudge per turn). */
+const interimSentFor = new Map<string, string>();
+
+// Delivery-failure feedback loop guard: cap consecutive "your reply didn't
+// deliver" notices per session so a genuinely-undeliverable channel can't spin
+// notice → retry → notice forever. Reset on any successful delivery.
+const deliveryFailNotifyCount = new Map<string, number>();
+const MAX_DELIVERY_FAIL_NOTICES = 2;
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -219,6 +247,12 @@ async function drainSession(session: Session): Promise<void> {
   }
 
   try {
+    // Before the delivery work: if a turn has been open too long with no reply,
+    // send a one-time "still working" nudge. Runs even when there's nothing to
+    // deliver (that's exactly the slow-turn case), and any nudge it writes is
+    // picked up by getDueOutboundMessages just below.
+    maybeSendInterimFeedback(session, inDb, outDb);
+
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
     if (allDue.length === 0) return;
@@ -262,6 +296,7 @@ async function drainSession(session: Session): Promise<void> {
         const firstDelivery = delivered.size === 0;
         delivered.add(msg.id);
         deliveryAttempts.delete(msg.id);
+        deliveryFailNotifyCount.delete(session.id); // a success clears the failure-notice loop guard
 
         // Pause the typing indicator after a real user-facing message
         // lands on the user's screen, so the client has time to visually
@@ -301,6 +336,9 @@ async function drainSession(session: Session): Promise<void> {
           });
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
+          // Close the loop: tell the container its reply never reached the user
+          // so it can re-send a corrected version instead of assuming success.
+          notifyContainerOfDeliveryFailure(session, msg, err);
         } else {
           const backoff = deliveryBackoffMs(attempts);
           deliveryAttempts.set(msg.id, { attempts, nextAttemptAt: Date.now() + backoff });
@@ -318,6 +356,123 @@ async function drainSession(session: Session): Promise<void> {
   } finally {
     outDb.close();
     inDb.close();
+  }
+}
+
+/**
+ * Interim "still working" feedback. If the newest user-facing inbound has gone
+ * unanswered past INTERIM_FEEDBACK_MS and the container is still touching its
+ * heartbeat (actually working, not dead), send exactly one nudge into the chat.
+ * Routed through writeOutboundDirect so it flows the normal delivery path
+ * (instance resolution, Telegram plaintext fallback, etc.).
+ */
+function maybeSendInterimFeedback(session: Session, inDb: Database.Database, outDb: Database.Database): void {
+  const inbound = inDb
+    .prepare(
+      `SELECT id, timestamp, platform_id, channel_type, thread_id
+       FROM messages_in
+       WHERE kind IN ('chat', 'chat-sdk') AND trigger = 1
+       ORDER BY seq DESC LIMIT 1`,
+    )
+    .get() as
+    | {
+        id: string;
+        timestamp: string;
+        platform_id: string | null;
+        channel_type: string | null;
+        thread_id: string | null;
+      }
+    | undefined;
+  if (!inbound || !inbound.channel_type || !inbound.platform_id) return;
+  if (interimSentFor.get(session.id) === inbound.id) return; // already nudged this turn
+
+  const inboundMs = Date.parse(inbound.timestamp);
+  if (!Number.isFinite(inboundMs) || Date.now() - inboundMs < INTERIM_FEEDBACK_MS) return;
+
+  // Already answered (or answering)? A user-facing chat row at/after the inbound
+  // means we've replied — no nudge. datetime() normalizes both timestamps.
+  const replied = outDb
+    .prepare(`SELECT 1 FROM messages_out WHERE kind = 'chat' AND datetime(timestamp) >= datetime(?) LIMIT 1`)
+    .get(inbound.timestamp);
+  if (replied) return;
+
+  // Only nudge while the container is actually working — a stale heartbeat means
+  // it died/stalled, which is the host-sweep's job, not a "still working" claim.
+  let hbFresh = false;
+  try {
+    hbFresh =
+      Date.now() - fs.statSync(heartbeatPath(session.agent_group_id, session.id)).mtimeMs < INTERIM_HEARTBEAT_FRESH_MS;
+  } catch {
+    hbFresh = false;
+  }
+  if (!hbFresh) return;
+
+  interimSentFor.set(session.id, inbound.id);
+  try {
+    writeOutboundDirect(session.agent_group_id, session.id, {
+      id: `interim-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'chat',
+      platformId: inbound.platform_id,
+      channelType: inbound.channel_type,
+      threadId: inbound.thread_id,
+      content: JSON.stringify({ text: INTERIM_TEXT }),
+    });
+    log.info('Sent interim "still working" feedback', { sessionId: session.id, waitedMs: Date.now() - inboundMs });
+  } catch (err) {
+    interimSentFor.delete(session.id); // let a later tick retry
+    log.warn('Interim feedback write failed', { sessionId: session.id, err });
+  }
+}
+
+/**
+ * Tell the CONTAINER that a user-facing reply permanently failed to deliver, so
+ * the agent knows the user never got it and can re-send a corrected version.
+ * Writes a `delivery_failed` system message into the inbound DB and wakes the
+ * container. Bounded per session to avoid a notice → retry → notice loop on a
+ * genuinely-undeliverable channel.
+ */
+function notifyContainerOfDeliveryFailure(
+  session: Session,
+  msg: { id: string; kind: string; content: string },
+  err: unknown,
+): void {
+  if (msg.kind !== 'chat') return; // only user-facing channel replies
+
+  const count = (deliveryFailNotifyCount.get(session.id) ?? 0) + 1;
+  deliveryFailNotifyCount.set(session.id, count);
+  if (count > MAX_DELIVERY_FAIL_NOTICES) {
+    log.warn('Suppressing delivery-failure notice (loop guard)', { sessionId: session.id, messageId: msg.id });
+    return;
+  }
+
+  let preview = '';
+  try {
+    preview = String((JSON.parse(msg.content) as { text?: unknown })?.text ?? '').slice(0, 200);
+  } catch {
+    /* non-JSON content — leave preview empty */
+  }
+  const reason = err instanceof Error ? err.message : String(err);
+
+  try {
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: `dfail-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'system',
+      timestamp: new Date().toISOString(),
+      content: JSON.stringify({
+        action: 'delivery_failed',
+        status: 'error',
+        result: {
+          reason,
+          undelivered_text: preview,
+          note: 'Your last reply could NOT be delivered to the user after retries — they did not receive it. Re-send a corrected version through your normal reply. If it looks like a formatting/markdown problem, simplify the formatting.',
+        },
+      }),
+      trigger: 1,
+    });
+    void wakeContainer(session);
+    log.info('Notified container of permanent delivery failure', { sessionId: session.id, messageId: msg.id });
+  } catch (e) {
+    log.warn('Failed to notify container of delivery failure', { sessionId: session.id, err: e });
   }
 }
 

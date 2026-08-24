@@ -35,7 +35,7 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
-import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
+import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb, heartbeatPath } from './session-manager.js';
 import {
   deliverSessionMessages,
   registerDeliveryBatchPreview,
@@ -694,5 +694,101 @@ describe('deliverSessionMessages — post-delivery hooks', () => {
     const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
     expect(delivered.has('th-1')).toBe(true);
     expect(delivered.has('th-2')).toBe(true);
+  });
+});
+
+describe('deliverSessionMessages — interim "still working" feedback (A)', () => {
+  function insertUserTurn(sessionId: string, id: string, ageMs: number): void {
+    const inDb = openInboundDb('ag-1', sessionId);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, content)
+         VALUES (?, 1, 'chat', ?, 'completed', 1, 'telegram:123', 'telegram', ?)`,
+      )
+      .run(id, new Date(Date.now() - ageMs).toISOString(), JSON.stringify({ text: 'do a big lookup' }));
+    inDb.close();
+  }
+
+  it('sends exactly one nudge when a turn is open past the threshold and the container is alive', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertUserTurn(session.id, 'in-slow', 60_000); // arrived 60s ago, no reply
+    fs.writeFileSync(heartbeatPath('ag-1', session.id), ''); // fresh heartbeat = alive
+
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(sent.some((c) => c.includes('Still on it'))).toBe(true);
+
+    // Idempotent: a later poll on the same open turn does not nudge again.
+    await deliverSessionMessages(session);
+    expect(sent.filter((c) => c.includes('Still on it')).length).toBe(1);
+  });
+
+  it('does not nudge before the threshold', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertUserTurn(session.id, 'in-fresh', 5_000); // only 5s old
+    fs.writeFileSync(heartbeatPath('ag-1', session.id), '');
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(sent.some((c) => c.includes('Still on it'))).toBe(false);
+  });
+
+  it('does not nudge when the heartbeat is stale (container not working)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertUserTurn(session.id, 'in-dead', 60_000);
+    // No heartbeat file → stale → not a "still working" case.
+    const sent: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, _tid, _kind, content) {
+        sent.push(content);
+        return 'pm';
+      },
+    });
+    await deliverSessionMessages(session);
+    expect(sent.some((c) => c.includes('Still on it'))).toBe(false);
+  });
+});
+
+describe('deliverSessionMessages — delivery-failure notice to the container (D)', () => {
+  it('writes a delivery_failed system message back to inbound when a reply is permanently dropped', async () => {
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-dfail');
+      setDeliveryAdapter({
+        async deliver() {
+          throw new Error('boom');
+        },
+      });
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        await deliverSessionMessages(session);
+        vi.advanceTimersByTime(120_000);
+      }
+      const inDb = openInboundDb('ag-1', session.id);
+      const row = inDb
+        .prepare("SELECT content FROM messages_in WHERE kind = 'system' ORDER BY seq DESC LIMIT 1")
+        .get() as { content: string } | undefined;
+      inDb.close();
+      expect(row).toBeDefined();
+      expect(row!.content).toContain('delivery_failed');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
