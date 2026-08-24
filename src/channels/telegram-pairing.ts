@@ -198,14 +198,20 @@ export async function tryConsume(input: ConsumeInput): Promise<PairingRecord | n
         at: new Date(now).toISOString(),
         matched: false,
       };
-      let recorded = false;
-      for (const r of store.pairings) {
-        if (r.status !== 'pending') continue;
+      const pending = store.pairings.filter((r) => r.status === 'pending');
+      for (const r of pending) {
         r.attempts = [...(r.attempts ?? []), attempt].slice(-MAX_ATTEMPTS_PER_RECORD);
-        // One attempt per code. A wrong guess invalidates the pairing
-        // immediately — pair-telegram observes the `invalidated` signal and
-        // auto-issues a fresh code (up to a retry cap).
-        r.status = 'invalidated';
+      }
+      // Rotate the code on a wrong guess (pair-telegram observes `invalidated`
+      // and auto-issues a fresh code, up to a retry cap) — but ONLY when there
+      // is exactly one pending pairing, so the wrong guess unambiguously targets
+      // it. With several concurrent pairings a wrong (or attacker-sent) code
+      // can't be attributed to one, so invalidating them all let a single stray
+      // 6-digit message nuke every operator's in-flight pairing. Then we just
+      // record the attempt; each operator retries their own still-pending code.
+      let recorded = false;
+      if (pending.length === 1) {
+        pending[0].status = 'invalidated';
         recorded = true;
       }
       writeStore(store);

@@ -154,6 +154,18 @@ describe('tryConsume', () => {
     expect(out).toBeNull();
     expect(getStatus(r.code)).toBe('invalidated');
   });
+
+  it('does NOT invalidate any pairing when several are pending (a stray wrong guess cannot nuke all)', async () => {
+    const a = await createPairing({ kind: 'wire-to', folder: 'work' });
+    const b = await createPairing({ kind: 'wire-to', folder: 'side' });
+    // A wrong 6-digit message from anyone while two pairings are in flight.
+    await tryConsume({ text: '999999', botUsername: 'b', platformId: 'attacker', isGroup: false });
+    // Neither is invalidated — each operator can still complete their own code.
+    expect(getStatus(a.code)).toBe('pending');
+    expect(getStatus(b.code)).toBe('pending');
+    const out = await tryConsume({ text: `@b ${a.code}`, botUsername: 'b', platformId: 'p', isGroup: false });
+    expect(out).not.toBeNull();
+  });
 });
 
 describe('getStatus', () => {
