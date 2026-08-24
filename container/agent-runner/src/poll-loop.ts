@@ -27,6 +27,7 @@ import {
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { loadGate, promptHasAllowedTrigger } from './gatekeeper.js';
+import { setCurrentTurn } from './trigger-match.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
@@ -247,6 +248,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
+    // Publish the current turn = the newest wake (trigger=1) message, so the
+    // gate below AND the per-game directive in providers/claude.ts both classify
+    // the message that engaged this turn, not a trigger=0 context row that sorts
+    // last by seq (which over-blocked real codes and leaked code-less turns).
+    publishCurrentTurn(keep);
+
     // MODULE-HOOK:gatekeeper:start
     // Hard game-lookup gate. When an enforcing gatekeeper skill is mounted and
     // this user-chat turn carries no allowed game trigger, deliver the fallback
@@ -356,6 +363,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
+/**
+ * Publish the current turn for trigger detection: the block of the newest wake
+ * (trigger=1) message in the batch. The gate and the per-game directive both
+ * read this via trigger-match.currentTurnText, so they classify the message
+ * that engaged the turn rather than whatever context row sorts last. No wake row
+ * (task/system batch) → null, which falls back to the last-block heuristic.
+ */
+function publishCurrentTurn(messages: MessageInRow[]): void {
+  const wakeRows = messages.filter((m) => m.trigger === 1);
+  setCurrentTurn(wakeRows.length > 0 ? formatMessages([wakeRows[wakeRows.length - 1]]) : null);
+}
+
 function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
@@ -534,6 +553,32 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
+
+        // Publish the current turn + run the hard gate here too: a code-less
+        // message that arrives while the container is warm is pushed into the
+        // active query, which previously bypassed the gate entirely — a locked
+        // lookup bot would then answer an off-topic follow-up from memory.
+        publishCurrentTurn(keep);
+        if (
+          GATEKEEPER &&
+          keep.every((m) => m.kind === 'chat' || m.kind === 'chat-sdk') &&
+          !promptHasAllowedTrigger(prompt, GATEKEEPER.allowedTriggers)
+        ) {
+          const fr = extractRouting(keep);
+          writeMessageOut({
+            id: generateId(),
+            in_reply_to: fr.inReplyTo,
+            kind: 'chat',
+            platform_id: fr.platformId,
+            channel_type: fr.channelType,
+            thread_id: fr.threadId,
+            content: JSON.stringify({ text: GATEKEEPER.fallbackMessage }),
+          });
+          markCompleted(keptIds);
+          log('Gatekeeper: follow-up carried no game trigger — sent usage card, not pushed');
+          return;
+        }
+
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;

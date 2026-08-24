@@ -5,9 +5,13 @@
  * @mention is rendered into the XML-escaped body before the game code, which a
  * naive `>\s*<trigger>` misses. See the "croque monsieur" regression below.
  */
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { triggerRegex, matchesAnyTrigger, currentTurnText } from './trigger-match.js';
+import { triggerRegex, matchesAnyTrigger, currentTurnText, setCurrentTurn } from './trigger-match.js';
+
+// Reset the module-global "current turn" before each test so a leak from
+// another suite (poll-loop publishes it) can't skew last-block detection.
+beforeEach(() => setCurrentTurn(null));
 
 // How formatter.formatSingleChat renders a chat message (escaped body).
 function fmt(bodyText: string): string {
@@ -102,5 +106,36 @@ describe('currentTurnText', () => {
 
   it('returns the whole string when there is no message block (bare body)', () => {
     expect(currentTurnText('mtg bare text')).toBe('mtg bare text');
+  });
+});
+
+describe('setCurrentTurn override (poll-loop publishes the wake message)', () => {
+  afterEach(() => setCurrentTurn(null)); // don't leak module state to other suites
+
+  it('makes currentTurnText return the published wake block, ignoring the prompt', () => {
+    setCurrentTurn(fmt('kdm how does the lion fight work?'));
+    // The prompt argument is a totally different (code-less) conversation.
+    expect(currentTurnText(convo('random chatter', 'more chatter'))).toBe(fmt('kdm how does the lion fight work?'));
+  });
+
+  it('null override restores the last-block behavior', () => {
+    setCurrentTurn(null);
+    const turn = currentTurnText(convo('mtg first', 'plain second'));
+    expect(turn.includes('plain second')).toBe(true);
+    expect(turn.includes('mtg first')).toBe(false);
+  });
+
+  it('OVER-BLOCK fix: a real code passes even when a code-less context row sorts last', () => {
+    // Wake = the kdm question; a later ambient message (code-less) is the last block.
+    setCurrentTurn(fmt('kdm can I dodge the King as Man?'));
+    const prompt = convo('kdm can I dodge the King as Man?', 'lol nice');
+    expect(matchesAnyTrigger(prompt, ['kdm', 'mtg'])).toBe(true);
+  });
+
+  it('LEAK fix: a code-less wake is blocked even when a context row starts with a code', () => {
+    // Wake = a code-less mention; an earlier/ambient message that starts with a code is the last block.
+    setCurrentTurn(fmt('how can I remove the blind impairment?'));
+    const prompt = convo('how can I remove the blind impairment?', 'kdm unrelated ambient line');
+    expect(matchesAnyTrigger(prompt, ['kdm', 'mtg'])).toBe(false);
   });
 });

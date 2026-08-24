@@ -7,6 +7,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { loadGate, promptHasAllowedTrigger } from './gatekeeper.js';
+import { setCurrentTurn } from './trigger-match.js';
+
+// currentTurnText reads a module-global "current turn" the poll loop publishes.
+// Other suites (poll-loop) set it and don't clear it; reset before each test so
+// promptHasAllowedTrigger here classifies the prompt argument, not a stale wake.
+beforeEach(() => setCurrentTurn(null));
 
 let dir: string;
 

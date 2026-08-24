@@ -28,20 +28,30 @@ export function triggerRegex(trigger: string): RegExp {
 }
 
 /**
- * The CURRENT turn's text: the LAST `<message …>…</message>` block in the
- * formatted prompt. Trigger detection must classify ONLY this block.
- *
- * A prompt can carry several message blocks: getPendingMessages merges the
- * waking message with the newest context-only rows that "ride along" (the
- * ongoing conversation), formatted oldest-first, so the current message is the
- * last block. Testing the WHOLE prompt lets a game code in an EARLIER context
- * block (e.g. a prior `mtg …` question) leak its classification onto a
- * code-less current message — the gate then wrongly passes and the game
- * directive is injected for an unrelated question. Scoping to the last block
- * keeps the decision per-message. Falls back to the whole string when there is
- * no block (host-side callers pass a bare message body).
+ * Explicit "current turn" text, published by the poll loop before it gates or
+ * queries a batch (initial AND follow-up). The wake message — the trigger=1 row
+ * that engaged this turn — is the correct thing to classify, but the formatted
+ * prompt is ordered by seq, so a trigger=0 context row that "rides along" with a
+ * HIGHER seq than the wake sorts LAST. The old last-block heuristic then picked
+ * that context row, which both over-blocked a real game code (the wake is not
+ * last) and leaked a code-less turn (a context row that starts with a code is
+ * last). Setting this to the wake block makes the gate and the per-game
+ * directive key off the same message and agree. null → last-block fallback.
+ */
+let currentTurnOverride: string | null = null;
+
+export function setCurrentTurn(text: string | null): void {
+  currentTurnOverride = text;
+}
+
+/**
+ * The CURRENT turn's text used for trigger detection. Returns the explicit
+ * override the poll loop published for this turn (the wake message's block); if
+ * none is set, falls back to the LAST `<message …>…</message>` block of the
+ * prompt (bare-body and test callers, where the last block is the current one).
  */
 export function currentTurnText(prompt: string): string {
+  if (currentTurnOverride !== null) return currentTurnOverride;
   const open = /<message\b[^>]*>/gi;
   let idx = -1;
   let m: RegExpExecArray | null;
