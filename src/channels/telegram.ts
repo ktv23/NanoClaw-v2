@@ -12,7 +12,7 @@ import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js'
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 import { tryConsume } from './telegram-pairing.js';
 
 /**
@@ -235,6 +235,45 @@ registerChannelAdapter('telegram', {
 
     const wrapped: ChannelAdapter = {
       ...bridge,
+      // Plain-text fallback: @chat-adapter/telegram renders replies as MarkdownV2,
+      // and Telegram rejects the whole send with a 400 "can't parse entities" when
+      // the agent's text produces an unbalanced entity (a stray * _ [ or an
+      // unterminated URL). Without this, such a reply is retried 3x and then
+      // silently dropped — the user sees nothing. On that specific error we resend
+      // the raw text with no parse_mode so the message still lands (markdown marks
+      // show literally). Only single-chunk messages hit this in practice; a
+      // >maxTextLength multi-chunk body could re-send an already-delivered chunk
+      // here, which is acceptable for a last-resort path. Non-entity errors rethrow
+      // untouched so real failures still surface.
+      async deliver(platformId: string, threadId: string | null, message: OutboundMessage) {
+        try {
+          return await bridge.deliver(platformId, threadId, message);
+        } catch (err) {
+          const errMsg = String((err as { message?: unknown } | undefined)?.message ?? err ?? '');
+          if (!/can'?t parse entities/i.test(errMsg)) throw err;
+          const text = (message.content as { text?: string } | null | undefined)?.text;
+          if (!text) throw err;
+          const chatId = platformId.split(':').slice(1).join(':');
+          const body: Record<string, unknown> = { chat_id: chatId, text };
+          const threadNum = threadId ? Number(threadId) : NaN;
+          if (Number.isFinite(threadNum)) body.message_thread_id = threadNum;
+          const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = (await res.json()) as { ok?: boolean; result?: { message_id?: number } };
+          if (!data.ok) {
+            log.error('Telegram plain-text fallback failed after markdown rejection', { chatId });
+            throw err;
+          }
+          log.warn('Telegram rejected markdown; delivered as plain text', {
+            chatId,
+            droppedFiles: message.files?.length ?? 0,
+          });
+          return data.result?.message_id != null ? String(data.result.message_id) : undefined;
+        }
+      },
       resolveChannelName: async (platformId: string) => {
         const chatId = platformId.split(':').slice(1).join(':');
         if (!chatId) return null;
