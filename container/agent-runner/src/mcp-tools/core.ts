@@ -136,7 +136,9 @@ export const sendFile: McpToolDefinition = {
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
     const id = generateId();
-    const filename = (args.filename as string) || path.basename(resolvedPath);
+    // Force a bare filename: an agent-supplied `filename` of `../../foo` would
+    // otherwise let path.join write the copy outside the per-message outbox dir.
+    const filename = path.basename((args.filename as string) || path.basename(resolvedPath));
 
     const outboxDir = path.join('/workspace/outbox', id);
     fs.mkdirSync(outboxDir, { recursive: true });

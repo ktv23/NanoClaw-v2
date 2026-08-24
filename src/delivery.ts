@@ -44,10 +44,29 @@ import type { PendingApproval, Session } from './types.js';
 
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
-const MAX_DELIVERY_ATTEMPTS = 3;
+// A failed send is retried with exponential backoff (see backoffMs) up to this
+// many times before giving up. Raised from 3 (which, on the ~1s poll, gave up
+// after only ~3s — a brief network blip or a channel 429 permanently dropped a
+// user-facing reply) so transient failures now get a multi-minute recovery
+// window before the row is marked failed.
+const MAX_DELIVERY_ATTEMPTS = 8;
 
-/** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
-const deliveryAttempts = new Map<string, number>();
+/**
+ * Backoff before the next retry. The first retry is immediate (a one-off blip
+ * recovers on the next ~1s poll); subsequent retries back off exponentially
+ * (2s, 4s, 8s … capped at 60s) so a rate-limited or down channel isn't hammered.
+ */
+function deliveryBackoffMs(attempts: number): number {
+  if (attempts <= 1) return 0;
+  return Math.min(2 ** (attempts - 1), 60) * 1000;
+}
+
+/**
+ * Per-message retry state. Resets on process restart (gives failed messages a
+ * fresh chance). `nextAttemptAt` spaces retries out via backoff instead of
+ * hammering the channel every ~1s poll tick.
+ */
+const deliveryAttempts = new Map<string, { attempts: number; nextAttemptAt: number }>();
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -230,6 +249,10 @@ async function drainSession(session: Session): Promise<void> {
     }
 
     for (const msg of undelivered) {
+      // Respect backoff: a message that just failed waits deliveryBackoffMs
+      // before the next attempt instead of retrying on every ~1s poll tick.
+      const retryState = deliveryAttempts.get(msg.id);
+      if (retryState && retryState.nextAttemptAt > Date.now()) continue;
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
@@ -268,8 +291,7 @@ async function drainSession(session: Session): Promise<void> {
           }
         }
       } catch (err) {
-        const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-        deliveryAttempts.set(msg.id, attempts);
+        const attempts = (retryState?.attempts ?? 0) + 1;
         if (attempts >= MAX_DELIVERY_ATTEMPTS) {
           log.error('Message delivery failed permanently, giving up', {
             messageId: msg.id,
@@ -280,11 +302,14 @@ async function drainSession(session: Session): Promise<void> {
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
         } else {
+          const backoff = deliveryBackoffMs(attempts);
+          deliveryAttempts.set(msg.id, { attempts, nextAttemptAt: Date.now() + backoff });
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,
             sessionId: session.id,
             attempt: attempts,
             maxAttempts: MAX_DELIVERY_ATTEMPTS,
+            retryInMs: backoff,
             err,
           });
         }

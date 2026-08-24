@@ -22,6 +22,7 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { GROUP_SCOPE_RESOURCES } from '../../cli/registry.js';
 import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
@@ -140,6 +141,17 @@ function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponseP
     return userId === approval.approver_user_id;
   }
 
+  // A `cli_command` from a cli_scope=global agent can carry a GLOBAL-effect
+  // command (e.g. `roles grant --role owner`, `policies set`) whose blast radius
+  // is not confined to the requesting group. A merely-scoped admin of that group
+  // must not be able to approve it — otherwise administering a global-scope agent
+  // group silently confers global authority (a scoped admin could have the agent
+  // request `roles grant` for themselves and then approve it). Require a global
+  // admin/owner unless the command's resource is group-scoped.
+  if (approval.action === 'cli_command' && !isGroupScopedCliCommand(approval)) {
+    return isOwner(userId) || isGlobalAdmin(userId);
+  }
+
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? getSession(approval.session_id)?.agent_group_id : null);
 
@@ -148,4 +160,22 @@ function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponseP
   }
 
   return hasAdminPrivilege(userId, agentGroupId);
+}
+
+/**
+ * True when a held `cli_command` targets a group-scoped resource (its effect is
+ * confined to the agent group), so a scoped admin of that group may approve it.
+ * Fails closed: an unparseable payload or unknown resource is treated as
+ * global-effect and requires a global approver.
+ */
+function isGroupScopedCliCommand(approval: PendingApproval): boolean {
+  try {
+    const payload = JSON.parse(approval.payload) as { frame?: { command?: string } };
+    const command = payload.frame?.command;
+    if (!command) return false;
+    const resource = command.trim().split(/\s+/)[0];
+    return GROUP_SCOPE_RESOURCES.has(resource);
+  } catch {
+    return false;
+  }
 }

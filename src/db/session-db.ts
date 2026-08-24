@@ -259,9 +259,14 @@ export interface OutboundMessage {
 export function getDueOutboundMessages(db: Database.Database): OutboundMessage[] {
   return db
     .prepare(
+      // Order by the monotonic `seq`, not `timestamp`: two rows written in the
+      // same millisecond (rapid multi-part sends in one turn) have equal
+      // timestamps and would otherwise deliver in arbitrary rowid order, so a
+      // multi-message reply could reach the user out of order. `seq` is the
+      // authoritative insertion order.
       `SELECT * FROM messages_out
        WHERE (deliver_after IS NULL OR datetime(deliver_after) <= datetime('now'))
-       ORDER BY timestamp ASC`,
+       ORDER BY seq ASC`,
     )
     .all() as OutboundMessage[];
 }

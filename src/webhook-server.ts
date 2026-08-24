@@ -18,6 +18,18 @@ import { log } from './log.js';
 
 const DEFAULT_PORT = 3000;
 
+// Chat-SDK webhook payloads are small (a few KB). Cap the buffered body so an
+// unauthenticated client can't exhaust host memory by POSTing an arbitrarily
+// large body to /webhook/<adapter> before signature verification runs.
+const MAX_WEBHOOK_BODY_BYTES = 1_048_576; // 1 MiB
+
+class WebhookBodyTooLargeError extends Error {
+  constructor() {
+    super('Webhook body exceeds size limit');
+    this.name = 'WebhookBodyTooLargeError';
+  }
+}
+
 interface WebhookEntry {
   chat: Chat;
   adapterName: string;
@@ -32,8 +44,21 @@ let server: http.Server | null = null;
 
 /** Convert Node.js IncomingMessage to a Web API Request. */
 async function toWebRequest(req: http.IncomingMessage): Promise<Request> {
+  // Reject on a declared oversize body before reading a single byte.
+  const declaredLen = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_WEBHOOK_BODY_BYTES) {
+    throw new WebhookBodyTooLargeError();
+  }
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    // Enforce the ceiling while streaming too — a chunked request can omit or
+    // lie about Content-Length.
+    if (total > MAX_WEBHOOK_BODY_BYTES) {
+      req.destroy();
+      throw new WebhookBodyTooLargeError();
+    }
     chunks.push(chunk as Buffer);
   }
   const body = Buffer.concat(chunks);
@@ -151,6 +176,13 @@ function ensureServer(): void {
       });
       await fromWebResponse(webRes, res);
     } catch (err) {
+      if (err instanceof WebhookBodyTooLargeError) {
+        if (!res.headersSent) {
+          res.writeHead(413, { 'Content-Type': 'text/plain' });
+          res.end('Payload Too Large');
+        }
+        return;
+      }
       log.error('Webhook handler error', { adapter: adapterName, url: req.url, err });
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -159,8 +191,13 @@ function ensureServer(): void {
     }
   });
 
-  server.listen(port, '0.0.0.0', () => {
-    log.info('Webhook server started', { port, adapters: [...routes.keys()] });
+  // Bind host is configurable: keep 0.0.0.0 as the default (external webhooks
+  // like GitHub / WhatsApp Cloud need reachability), but let an operator whose
+  // webhooks arrive via a local tunnel/reverse-proxy set WEBHOOK_HOST=127.0.0.1
+  // to take the endpoint off the LAN entirely.
+  const host = process.env.WEBHOOK_HOST || '0.0.0.0';
+  server.listen(port, host, () => {
+    log.info('Webhook server started', { port, host, adapters: [...routes.keys()] });
   });
 }
 

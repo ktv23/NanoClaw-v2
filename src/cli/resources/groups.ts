@@ -19,6 +19,7 @@ import {
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
 import { initGroupFilesystem } from '../../group-init.js';
+import { assertValidGroupFolder } from '../../group-folder.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import {
   formatRestampResult,
@@ -156,6 +157,12 @@ registerResource({
         }
         const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
+        // Validate before any path.resolve(GROUPS_DIR, folder): an unchecked
+        // `--folder ../../…` would bind-mount an arbitrary host dir read-write
+        // into the container, and a `:` would inject extra `-v` fields. The two
+        // sibling create paths (create-agent.ts, setup/register.ts) already
+        // validate; this bare path was the gap.
+        assertValidGroupFolder(folder);
         const name = (args.name as string) ?? folder;
         const existing = getAgentGroupByFolder(folder);
         if (existing) {

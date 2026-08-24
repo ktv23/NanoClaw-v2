@@ -4,12 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import os from 'os';
 
-import {
-  hardeningArgs,
-  resolveProviderName,
-  selectedSkillNames,
-  skillEnforcesLockdown,
-} from './container-runner.js';
+import { hardeningArgs, resolveProviderName, selectedSkillNames, skillEnforcesLockdown } from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {

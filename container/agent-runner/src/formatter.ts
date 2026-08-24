@@ -286,18 +286,26 @@ export function stripLegacyTaskContract(prompt: string): string {
   return contractStart >= 0 ? prompt.slice(0, contractStart).trimEnd() : prompt;
 }
 
+// Neutralize angle brackets in serialized (often untrusted) payloads so a
+// webhook/system body can't inject raw <message>/<internal>/harness pseudo-tags
+// into the prompt context. Only `<`/`>` are escaped (not quotes) so the JSON
+// stays readable for the model; chat bodies already go through escapeXml.
+function escapeTags(json: string): string {
+  return json.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function formatWebhookMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const source = content.source || 'unknown';
   const event = content.event || 'unknown';
   const from = originAttr(msg);
-  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${JSON.stringify(content.payload || content, null, 2)}</webhook>`;
+  return `<webhook${from} source="${escapeXml(source)}" event="${escapeXml(event)}">${escapeTags(JSON.stringify(content.payload || content, null, 2))}</webhook>`;
 }
 
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const from = originAttr(msg);
-  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${JSON.stringify(content.result || null)}</system_response>`;
+  return `<system_response${from} action="${escapeXml(content.action || 'unknown')}" status="${escapeXml(content.status || 'unknown')}">${escapeTags(JSON.stringify(content.result || null))}</system_response>`;
 }
 
 /**

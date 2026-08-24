@@ -163,40 +163,41 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 });
 
 describe('deliverSessionMessages — retry and permanent failure', () => {
-  it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS (3)', async () => {
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertOutbound('ag-1', session.id, 'out-flaky');
+  it('retries on adapter failure and marks failed after MAX_DELIVERY_ATTEMPTS', async () => {
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-flaky');
 
-    let callCount = 0;
-    setDeliveryAdapter({
-      async deliver() {
-        callCount++;
-        throw new Error('network timeout');
-      },
-    });
+      let callCount = 0;
+      setDeliveryAdapter({
+        async deliver() {
+          callCount++;
+          throw new Error('network timeout');
+        },
+      });
 
-    // Attempt 1
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(1);
+      // MAX_DELIVERY_ATTEMPTS (8) failing attempts. The first retry is immediate;
+      // later ones back off, so advance the clock past the backoff between polls.
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        await deliverSessionMessages(session);
+        expect(callCount).toBe(attempt);
+        vi.advanceTimersByTime(120_000);
+      }
 
-    // Attempt 2
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(2);
+      // Next poll — message is now recorded failed, adapter not called again.
+      await deliverSessionMessages(session);
+      expect(callCount).toBe(8);
 
-    // Attempt 3 — should mark as permanently failed
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(3);
-
-    // Attempt 4 — message is now in delivered (as failed), adapter not called
-    await deliverSessionMessages(session);
-    expect(callCount).toBe(3);
-
-    // Verify the message is in the delivered table with 'failed' status
-    const inDb = openInboundDb('ag-1', session.id);
-    const delivered = getDeliveredIds(inDb);
-    inDb.close();
-    expect(delivered.has('out-flaky')).toBe(true);
+      // Verify the message is in the delivered table with 'failed' status
+      const inDb = openInboundDb('ag-1', session.id);
+      const delivered = getDeliveredIds(inDb);
+      inDb.close();
+      expect(delivered.has('out-flaky')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not acknowledge a message when no channel adapter is registered (#2995)', async () => {
@@ -206,31 +207,38 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     // throw so the row takes the normal retry → failed path. Uses the REAL
     // createChannelDeliveryAdapter with an empty registry — the state after
     // an adapter factory returns null (missing credentials) at startup.
-    seedAgentAndChannel();
-    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertOutbound('ag-1', session.id, 'out-offline');
+    vi.useFakeTimers();
+    try {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-offline');
 
-    setDeliveryAdapter(createChannelDeliveryAdapter());
+      setDeliveryAdapter(createChannelDeliveryAdapter());
 
-    // Attempt 1 — must NOT be acknowledged as delivered
-    await deliverSessionMessages(session);
-    let inDb = openInboundDb('ag-1', session.id);
-    expect(getDeliveredIds(inDb).has('out-offline')).toBe(false);
-    inDb.close();
+      // Attempt 1 — must NOT be acknowledged as delivered
+      await deliverSessionMessages(session);
+      let inDb = openInboundDb('ag-1', session.id);
+      expect(getDeliveredIds(inDb).has('out-offline')).toBe(false);
+      inDb.close();
 
-    // Attempts 2 and 3 — exhausts MAX_DELIVERY_ATTEMPTS
-    await deliverSessionMessages(session);
-    await deliverSessionMessages(session);
+      // Exhaust the remaining MAX_DELIVERY_ATTEMPTS (8 total), advancing past backoff.
+      for (let attempt = 2; attempt <= 8; attempt++) {
+        vi.advanceTimersByTime(120_000);
+        await deliverSessionMessages(session);
+      }
 
-    // The row must end as status='failed', never 'delivered'
-    inDb = openInboundDb('ag-1', session.id);
-    const row = inDb
-      .prepare('SELECT status, platform_message_id FROM delivered WHERE message_out_id = ?')
-      .get('out-offline') as { status: string; platform_message_id: string | null } | undefined;
-    inDb.close();
-    expect(row).toBeDefined();
-    expect(row!.status).toBe('failed');
-    expect(row!.platform_message_id).toBeNull();
+      // The row must end as status='failed', never 'delivered'
+      inDb = openInboundDb('ag-1', session.id);
+      const row = inDb
+        .prepare('SELECT status, platform_message_id FROM delivered WHERE message_out_id = ?')
+        .get('out-offline') as { status: string; platform_message_id: string | null } | undefined;
+      inDb.close();
+      expect(row).toBeDefined();
+      expect(row!.status).toBe('failed');
+      expect(row!.platform_message_id).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('clears attempt counter on successful delivery', async () => {
@@ -367,10 +375,16 @@ describe('deliverSessionMessages — permission check', () => {
       },
     });
 
-    // Deliver 3 times to exhaust retries
-    await deliverSessionMessages(session);
-    await deliverSessionMessages(session);
-    await deliverSessionMessages(session);
+    // Exhaust MAX_DELIVERY_ATTEMPTS (8), advancing past backoff between polls.
+    vi.useFakeTimers();
+    try {
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        await deliverSessionMessages(session);
+        vi.advanceTimersByTime(120_000);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
 
     // Adapter never called — permission check throws before reaching it
     expect(calls).toHaveLength(0);

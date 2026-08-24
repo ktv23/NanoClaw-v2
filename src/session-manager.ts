@@ -407,8 +407,8 @@ export function openOutboundDbRw(agentGroupId: string, sessionId: string): Datab
  * Needs the read-write open — the readonly handle the delivery poll uses
  * can't INSERT. This is a host-side write to the container-owned outbound.db,
  * but it's safe even with a container running: both sides open with DELETE
- * journal + busy_timeout, and the even host seq stays out of the container's
- * odd-seq space.
+ * journal + busy_timeout, and the host writes an EVEN seq that stays out of
+ * the container's odd-seq space (see the seq expression below).
  */
 export function writeOutboundDirect(
   agentGroupId: string,
@@ -425,8 +425,14 @@ export function writeOutboundDirect(
   const db = openOutboundDbRw(agentGroupId, sessionId);
   try {
     db.prepare(
+      // Next EVEN seq strictly greater than MAX. `MAX + 2` was wrong: the
+      // container writes ODD seqs, so once it has replied MAX(seq) is odd and
+      // `MAX + 2` is also odd — landing in the container's lane, where a
+      // concurrent container INSERT collides on the UNIQUE seq (host row
+      // silently dropped by INSERT OR IGNORE; container INSERT throws).
+      // Rounding up to the next even keeps the host lane disjoint from odd.
       `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
-       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, (SELECT ((COALESCE(MAX(seq), 0) / 2) + 1) * 2 FROM messages_out), ?, ?, ?, ?, ?, ?)`,
     ).run(
       message.id,
       new Date().toISOString(),

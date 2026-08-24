@@ -537,6 +537,13 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
+        // Re-stamp the a2a reply id for THIS pushed batch. current_in_reply_to
+        // is set once at the initial batch start (line ~288); send_message /
+        // send_file read it, so without this a reply the model produces for a
+        // follow-up would be stamped with the ORIGINAL batch's first message —
+        // a wrong reply-quote, and in agent-to-agent a cross-session misroute
+        // (the follow-up's answer return-routed to the original requester).
+        setCurrentInReplyTo(extractRouting(keep).inReplyTo);
         query.push(prompt);
         archivePrompts.push(prompt);
         markCompleted(keptIds);
