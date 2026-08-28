@@ -157,6 +157,17 @@ export function clearContainerToolInFlight(): void {
  * The host checks this file's mtime for stale container detection.
  * A file touch is cheaper and avoids cross-boundary DB write contention.
  */
+/**
+ * Point the heartbeat file at `p` (tests only). Returns the previous path so a
+ * test can restore it. Production sets the path once via the default; nothing
+ * else reassigns it.
+ */
+export function setHeartbeatPathForTest(p: string): string {
+  const prev = _heartbeatPath;
+  _heartbeatPath = p;
+  return prev;
+}
+
 export function touchHeartbeat(): void {
   const p = _heartbeatPath;
   const now = new Date();

@@ -480,7 +480,23 @@ export async function processQuery(
   let pollInFlight = false;
   let endedForCommand = false;
   let corruptionStreak = 0;
+  // True only while a post-init turn is actively streaming (between the turn's
+  // first work and its `result`). Gates the periodic heartbeat touch below so
+  // the host's interim "still working" nudge — which requires a fresh heartbeat
+  // (<15s) — fires on time even across a long no-event stretch (SDK compaction,
+  // a slow single tool call). Left false while IDLE between turns so an idle
+  // container's heartbeat goes stale and the host's 30-min ceiling recycles it,
+  // and left false before the first 'init' so a pre-init resume/startup hang
+  // keeps the heartbeat frozen for host-sweep's 60s kill-claim. Post-init
+  // mid-turn wedges were already ceiling-only (kill-claim can't fire once the
+  // heartbeat advanced past the claim), so feeding the heartbeat here weakens
+  // no detection we had.
+  let turnInFlight = false;
   const pollHandle = setInterval(() => {
+    // Liveness heartbeat during an active turn: the SDK can go many seconds
+    // without emitting an event (the only other thing that touches the
+    // heartbeat), which would otherwise starve the interim nudge.
+    if (turnInFlight) touchHeartbeat();
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
@@ -592,6 +608,7 @@ export async function processQuery(
         query.push(prompt);
         archivePrompts.push(prompt);
         markCompleted(keptIds);
+        turnInFlight = true; // a follow-up turn is now streaming
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -637,6 +654,10 @@ export async function processQuery(
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
+        // The SDK session is live (any resume is done) — the first turn is now
+        // streaming, so from here the periodic heartbeat may run. Before this a
+        // pre-init hang leaves the heartbeat frozen so kill-claim (60s) fires.
+        turnInFlight = true;
         // Persist immediately so a mid-turn container crash still lets the
         // next wake resume the conversation. Without this, the session id
         // was only written after the full stream completed — if the
@@ -665,6 +686,10 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        // Turn boundary → idle until the next push: stop feeding the heartbeat
+        // so an idle container ages out under the host ceiling. A retry pushed
+        // below (wrap / task-block nudge) re-arms it.
+        turnInFlight = false;
         if (event.text) {
           const { sent, hasUnwrapped, taskBlocks, resultBlocks } = dispatchResultText(event.text, routing, {
             midTurnSent,
@@ -725,6 +750,7 @@ export async function processQuery(
                   `Your destinations: ${names}. ` +
                   `Please re-send your response with the correct wrapping.</system>`,
               );
+              turnInFlight = true; // retry turn is streaming
             }
             if (willRetryTaskBlocks) {
               taskBlockNudged = true;
@@ -732,6 +758,7 @@ export async function processQuery(
                 .map((d) => d.name)
                 .join(', ');
               query.push(buildTaskBlockNudge(taskBlocks, names));
+              turnInFlight = true; // retry turn is streaming
             }
             // A retry result (wrapping or task-block nudge) answers the SAME
             // user prompt — keep it queued so the retry archives against it,
