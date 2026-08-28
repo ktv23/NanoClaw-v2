@@ -1027,17 +1027,28 @@ function maxOutboundSeq(): number {
 }
 
 /**
- * Has ANY chat row been written to outbound.db after `afterSeq`? Feeds the
- * result door's nudge decision: unlike the frame-local midTurnSent count,
- * this also sees MCP send_message / send_file deliveries made this turn, so
- * an agent that already replied via tools is not nudged into repeating
+ * Has ANY chat row the CONTAINER wrote landed in outbound.db after `afterSeq`?
+ * Feeds the result door's nudge decision: unlike the frame-local midTurnSent
+ * count, this also sees MCP send_message / send_file deliveries made this turn,
+ * so an agent that already replied via tools is not nudged into repeating
  * itself. Fail-open to false: if the lookup breaks, the nudge may fire
  * spuriously (a repeat coax), never silently swallow an undelivered turn.
+ *
+ * `seq % 2 = 1` is load-bearing: the question is "did the AGENT deliver
+ * anything this turn?", and the seq-parity invariant reserves odd seq for
+ * container writes / even for host writes (see db/messages-out.ts:99). The
+ * host injects even-seq `kind='chat'` rows for out-of-band feedback — notably
+ * the interim "still working" nudge (src/delivery.ts), which lands in THIS
+ * outbound.db past turnStartSeq on any turn slow enough (>30s) to trigger it.
+ * Counting that host row would flip turnDelivered to a false `true`, so the
+ * result door suppresses the agent's real answer as a "repeat" and skips the
+ * wrap-nudge — the reply is silently dropped and the model, whose SDK history
+ * still shows it answered, confabulates "I already got back to you."
  */
 function chatRowWrittenSince(afterSeq: number): boolean {
   try {
     const row = getOutboundDb()
-      .prepare("SELECT 1 AS hit FROM messages_out WHERE seq > ? AND kind = 'chat' LIMIT 1")
+      .prepare("SELECT 1 AS hit FROM messages_out WHERE seq > ? AND seq % 2 = 1 AND kind = 'chat' LIMIT 1")
       .get(afterSeq);
     return row !== undefined && row !== null;
   } catch (err) {

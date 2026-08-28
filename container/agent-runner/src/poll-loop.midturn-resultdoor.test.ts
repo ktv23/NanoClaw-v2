@@ -471,6 +471,53 @@ describe('DB-visible sends gate the nudge', () => {
   });
 });
 
+// ── Host-injected feedback (even seq) must not read as an agent delivery ──
+//
+// Regression: the host writes the interim "still working" nudge (src/delivery.ts)
+// as a kind='chat' row straight into this outbound.db whenever a turn stays open
+// past 30s. That row lands past turnStartSeq. If the result-door nudge decision
+// counted it, a slow turn whose real answer arrives only via the result door
+// would see turnDelivered=true, suppress the answer as a "repeat", and skip the
+// wrap-nudge — the reply is silently dropped and the model confabulates that it
+// already answered. The nudge decision must only count container-authored (odd
+// seq) rows; host feedback is even-seq.
+
+describe('host-injected interim nudge does not gate the wrap-nudge', () => {
+  it('an even-seq host chat row past turnStartSeq is ignored: the result-door-only answer still nudges', async () => {
+    seedDest();
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      // Host injects the interim "still working" nudge mid-turn: an even-seq
+      // kind='chat' row, written directly (not via the container's odd-seq
+      // writeMessageOut). This is the exact shape from src/delivery.ts.
+      getOutboundDb()
+        .prepare(
+          `INSERT INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+           VALUES (?, ?, ?, 'chat', ?, ?, NULL, ?)`,
+        )
+        .run(
+          'interim-x',
+          2,
+          new Date().toISOString(),
+          'chan-1',
+          'discord',
+          JSON.stringify({ text: "⏳ Still on it — this one's taking a bit, hang tight." }),
+        );
+      // The agent's real answer arrives only in the result (no text event) —
+      // the drift shape that must still nudge-and-retry, not be swallowed.
+      yield { type: 'result', text: '<message to="discord-main">The full breakdown you asked for.</message>' };
+    }
+    const { query, pushes } = makeStubQuery(events());
+
+    await processQuery(query, CHAT_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, true);
+
+    // The answer was NOT delivered from the result door (only the host nudge row
+    // exists), and crucially the wrap-nudge fired so the model re-sends.
+    expect(deliveredTexts()).toEqual(["⏳ Still on it — this one's taking a bit, hang tight."]);
+    expect(nudges(pushes)).toHaveLength(1);
+  });
+});
+
 // ── Failure ordering — mid-turn outbound write fails ──
 
 describe('mid-turn delivery write failure', () => {
