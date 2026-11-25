@@ -12,6 +12,8 @@ import { getPendingMessages } from '../db/messages-in.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { gateLookupBatch, loadGate, promptHasAllowedTrigger, resetGateForTest } from './gate.js';
+// Registers Claude's command lists, so `/compact` is classified as it is in production.
+import '../provider-contracts/index.js';
 import { currentTurnText, setCurrentTurn } from './trigger-match.js';
 
 // currentTurnText reads a module-global "current turn" the poll loop publishes.
@@ -224,12 +226,29 @@ describe('gateLookupBatch (real session mailbox)', () => {
     expect(currentTurnText('ignored')).toContain('mtg what does Liliana do?');
   });
 
-  it('passes an authorised slash command instead of answering it with the usage card', async () => {
+  it("passes an admin's slash command instead of answering it with the usage card", async () => {
+    // The host lets an admin command reach a container only from an owner or admin.
     resetGateForTest(dir);
     insert('c1', 'chat', { sender: 'Kevin', text: '/compact' });
 
-    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['c1']);
+    expect(ids(await gateLookupBatch(getPendingMessages(), 'claude'))).toEqual(['c1']);
     expect(fallbacks()).toEqual([]);
+  });
+
+  it('gates any other slash-prefixed message: the host passes unknown commands through from anyone', async () => {
+    resetGateForTest(dir);
+    insert('m1', 'chat', { sender: 'Kin', text: '/joke tell me one about wizards' });
+
+    expect(await gateLookupBatch(getPendingMessages(), 'claude')).toEqual([]);
+    expect(fallbacks()).toEqual(['use a code']);
+  });
+
+  it('gates a slash-prefixed message that only resembles an admin command', async () => {
+    resetGateForTest(dir);
+    insert('m1', 'chat', { sender: 'Kin', text: '/compactly explain trample' });
+
+    expect(await gateLookupBatch(getPendingMessages(), 'claude')).toEqual([]);
+    expect(fallbacks()).toEqual(['use a code']);
   });
 
   it('classifies the wake message, not a context row that sorts after it', async () => {

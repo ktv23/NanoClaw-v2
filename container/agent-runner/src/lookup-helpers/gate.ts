@@ -30,7 +30,7 @@ import path from 'node:path';
 
 import { markCompleted, type MessageInRow } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { extractRouting, formatMessages, isRunnerCommand, isSessionEcho } from '../formatter.js';
+import { categorizeMessage, extractRouting, formatMessages, isSessionEcho } from '../formatter.js';
 import { matchesAnyTrigger, setCurrentTurn } from './trigger-match.js';
 
 const SELECTED_SKILLS_DIR = '/home/node/.claude/skills';
@@ -97,16 +97,23 @@ export function resetGateForTest(dir?: string): void {
 }
 
 /**
- * A chat message a person typed on a platform. Chat rows the host or another
- * agent addressed to this agent (channel `agent`: an approval result, a
- * delivery-failure notice) and session echoes are not, and neither is a slash
- * command the runner dispatches itself (`/compact`, `/cost`, …): the host has
- * already authorised those, and they are not questions.
+ * A chat message a person typed on a platform, that the gate must judge. Chat
+ * rows the host or another agent addressed to this agent (channel `agent`: an
+ * approval result, a delivery-failure notice) and session echoes are not.
+ *
+ * Nor is an ADMIN slash command (`/compact`, `/cost`, …): the host's command
+ * gate lets those reach a container only when an owner or admin of this group
+ * sent them, so one that arrives here is an operator's instruction, not a
+ * question.
+ *
+ * Every OTHER slash-prefixed message is judged like any message. The host
+ * passes unknown slash commands through from anyone, so exempting them would
+ * let anybody step around a locked-down bot by starting a message with `/`.
  */
 function isAsked(m: MessageInRow, providerName: string): boolean {
   if (m.kind !== 'chat' && m.kind !== 'chat-sdk') return false;
   if (m.channel_type === 'agent' || isSessionEcho(m)) return false;
-  return !isRunnerCommand(m, providerName);
+  return categorizeMessage(m, providerName).category !== 'admin';
 }
 
 /**
@@ -135,8 +142,8 @@ function publishCurrentTurn(batch: MessageInRow[], providerName: string): void {
  * Always publishes the current turn. Then, when a gate is active and the
  * message a person is waiting on opens with no allowed trigger, it writes the
  * fallback message to that person's chat, marks their rows completed, and
- * returns the batch without them. Everything nobody typed — tasks, webhooks,
- * system messages, notices addressed to the agent, authorised slash commands —
+ * returns the batch without them. Everything else — tasks, webhooks, system
+ * messages, notices addressed to the agent, an admin's slash commands —
  * always stays in the batch, so a notice that shares a batch with an off-topic
  * message is still delivered to the model while the off-topic message is not.
  *
