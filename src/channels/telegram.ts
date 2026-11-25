@@ -1,18 +1,28 @@
 /**
- * Telegram channel adapter (v2) — uses Chat SDK bridge, with a pairing
- * interceptor wrapped around onInbound to verify chat ownership before
- * registration. See telegram-pairing.ts for the why.
+ * Telegram channel adapter (v2) — uses Chat SDK bridge, with an inbound
+ * interceptor for setup pairing and the owner/global-admin `/connect_group` command.
+ *
+ * Additional bot identities: set TELEGRAM_INSTANCES=<name>[,<name>...] plus a
+ * per-instance token (TELEGRAM_BOT_TOKEN_<NAME>; name uppercased, dashes to
+ * underscores). Each name registers under the `telegram-<name>` instance key
+ * through the same createTelegramBridge factory as the default bot, so the
+ * interceptor, pairing, and wiring defaults are shared. channelType stays
+ * 'telegram' either way: user ids, formatting, and container config are one
+ * namespace across bots. See .claude/skills/telegram-multi-instance.
  */
-import { createTelegramAdapter } from '@chat-adapter/telegram';
+
+import { createTelegramAdapter, TelegramFormatConverter } from '@chat-adapter/telegram';
+import { cardChildToFallbackText, convertEmojiPlaceholders, type CardChild, type CardElement } from 'chat';
 
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
-import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
+import { grantRole, hasAnyOwner, isGlobalAdmin, isOwner } from '../modules/permissions/db/user-roles.js';
 import { upsertUser } from '../modules/permissions/db/users.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import * as askQuestion from './ask-question.js';
 import { tryConsume } from './telegram-pairing.js';
 
 /**
@@ -25,6 +35,121 @@ const TELEGRAM_DEFAULTS: ChannelDefaults = {
   group: { engageMode: 'mention', threads: false, unknownSenderPolicy: 'request_approval' },
   mentions: 'platform',
 };
+
+/**
+ * Keep `/commands` on the message path. Adapters >= 4.31 send a message that
+ * starts with a bot command to onSlashCommand, which the bridge does not
+ * register, so `/connect_group`, `/start connect` and agent commands were
+ * dropped. Older adapters have no such method, so this is a no-op there.
+ */
+export function keepCommandsAsMessages(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  const a = adapter as unknown as { handleSlashCommandUpdate?: unknown };
+  if (typeof a.handleSlashCommandUpdate === 'function') a.handleSlashCommandUpdate = () => false;
+}
+
+type TelegramAttachment = { type: string; fetchMetadata?: { fileId?: string } };
+
+/**
+ * Type a recorded voice note 'voice', as WhatsApp and iMessage do. The adapter
+ * types it 'audio', like a music file. An adapter without extractAttachments
+ * is left as it is.
+ */
+export function markVoiceNotes(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  const a = adapter as unknown as {
+    extractAttachments?: (raw: { voice?: { file_id?: string } }) => TelegramAttachment[];
+  };
+  if (typeof a.extractAttachments !== 'function') return;
+  const extract = a.extractAttachments.bind(adapter);
+  a.extractAttachments = (raw) => {
+    const voiceId = raw?.voice?.file_id;
+    return extract(raw).map((att) =>
+      voiceId && att.fetchMetadata?.fileId === voiceId ? { ...att, type: 'voice' } : att,
+    );
+  };
+}
+
+const isVoice = (att: unknown): boolean => (att as { type?: unknown } | null)?.type === 'voice';
+
+/** The bridge forwards an attachment's type and drops other fields, so flag voice notes on the way to the host. */
+export function flagVoiceNotes(onInbound: ChannelSetup['onInbound']): ChannelSetup['onInbound'] {
+  return (platformId, threadId, message) => {
+    const content = message.content as { attachments?: unknown } | null;
+    const attachments = content?.attachments;
+    if (!Array.isArray(attachments) || !attachments.some(isVoice)) return onInbound(platformId, threadId, message);
+    const flagged = attachments.map((att) => (isVoice(att) ? { ...att, isVoiceNote: true } : att));
+    return onInbound(platformId, threadId, { ...message, content: { ...content, attachments: flagged } });
+  };
+}
+
+const TELEGRAM_MESSAGE_LIMIT = 4096;
+
+/**
+ * Refuse a question card that Telegram would cut. The adapter sends a card as
+ * MarkdownV2 and cuts it past 4,096 with its buttons kept, and lists, links
+ * and email addresses grow well past double on the way. A core without
+ * CardTooLongError has no refusal to raise, so there this is a no-op.
+ */
+export function refuseCutCards(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  const { CardTooLongError } = askQuestion as { CardTooLongError?: new (reason: string) => Error };
+  if (!CardTooLongError) return;
+  const converter = new TelegramFormatConverter();
+  // Match the adapter's card rendering before its truncation step.
+  const sentLength = (card: CardElement): number => {
+    const fallback = (child: CardChild): string | null =>
+      child.type === 'divider'
+        ? '---'
+        : child.type === 'section'
+          ? child.children.map(fallback).filter(Boolean).join('\n')
+          : cardChildToFallbackText(child);
+    const parts = [card.title && `**${card.title}**`, card.subtitle, ...card.children.map(fallback)];
+    return convertEmojiPlaceholders(converter.fromMarkdown(parts.filter(Boolean).join('\n')), 'gchat').length;
+  };
+  // Card titles are plain text. The Telegram adapter interpolates them into
+  // Markdown, so escape at this boundary (Slack instead uses a plain header).
+  // `&` too: the adapter's parser decodes `&#x202E;` into a hidden character.
+  const literalTitle = (card: CardElement): CardElement => ({
+    ...card,
+    title: card.title?.replace(/[\\`*_~[\]()<>&]/g, '\\$&'),
+  });
+  const post = adapter.postMessage.bind(adapter);
+  adapter.postMessage = async (...args) => {
+    if (typeof args[1] === 'object' && 'card' in args[1]) args[1] = { ...args[1], card: literalTitle(args[1].card) };
+    const message = args[1];
+    const own = typeof message === 'object' && 'card' in message;
+    const card = own ? message.card : undefined;
+    const hasAnswerButtons = (children: CardChild[]): boolean =>
+      children.some((child) =>
+        child.type === 'actions'
+          ? child.children.some((button) => button.type === 'button')
+          : child.type === 'section' && hasAnswerButtons(child.children),
+      );
+    if (card && hasAnswerButtons(card.children)) {
+      const length = sentLength(card);
+      if (length > TELEGRAM_MESSAGE_LIMIT) {
+        throw new CardTooLongError(
+          `the request is too long to show in full on a card (${length} characters as Telegram sends it, limit ${TELEGRAM_MESSAGE_LIMIT})`,
+        );
+      }
+    }
+    return post(...args);
+  };
+  // The bridge's resolved card ends with a muted decision. Refuse an edit
+  // that would silently cut it, so the bridge retries with title and decision
+  // only. Moving the decision ahead of the request is insufficient: Markdown
+  // spanning the cut can cause the adapter to drop that whole span.
+  const edit = adapter.editMessage.bind(adapter);
+  adapter.editMessage = async (...args) => {
+    if (typeof args[2] === 'object' && 'card' in args[2]) args[2] = { ...args[2], card: literalTitle(args[2].card) };
+    const message = args[2];
+    if (typeof message === 'object' && 'card' in message) {
+      const { card } = message;
+      if (sentLength(card) > TELEGRAM_MESSAGE_LIMIT) {
+        throw new CardTooLongError('the resolved card is too long to show its decision in full on Telegram');
+      }
+    }
+    return edit(...args);
+  };
+}
 
 /**
  * Retry a one-shot operation that can fail on transient network errors at
@@ -85,54 +210,166 @@ function readInboundFields(message: InboundMessage): InboundFields {
   if (message.kind !== 'chat-sdk' || !message.content || typeof message.content !== 'object') {
     return { text: '', authorUserId: null };
   }
-  const c = message.content as { text?: string; author?: { userId?: string } };
-  return { text: c.text ?? '', authorUserId: c.author?.userId ?? null };
+  const text = 'text' in message.content && typeof message.content.text === 'string' ? message.content.text : '';
+  const author = 'author' in message.content ? message.content.author : null;
+  const authorUserId =
+    author && typeof author === 'object' && 'userId' in author && typeof author.userId === 'string'
+      ? author.userId
+      : null;
+  return { text, authorUserId };
 }
 
 /**
- * Build an onInbound interceptor that consumes pairing codes before they
- * reach the router. On match: records the chat + its paired user, promotes
- * the user to owner if the instance has no owner yet, and short-circuits.
- * On miss: forwards to the host.
+ * `/connect_group` only opens Telegram's native picker. The existing
+ * unknown-channel approval flow remains the authority that creates a wiring.
  */
-/**
- * Send a one-shot confirmation back to the paired chat. Best-effort — failures
- * are logged but never propagated, so a Telegram outage can't undo a successful
- * pairing or trigger the interceptor's fail-open path.
- */
-async function sendPairingConfirmation(token: string, platformId: string): Promise<void> {
+function isConnectGroupCommand(text: string, botUsername: string | null): boolean {
+  const command = text.trim().toLowerCase();
+  return (
+    command === '/connect_group' || (botUsername !== null && command === `/connect_group@${botUsername.toLowerCase()}`)
+  );
+}
+
+function isStartGroupConnectCommand(text: string, botUsername: string | null): boolean {
+  return botUsername !== null && text.trim().toLowerCase() === `/start@${botUsername.toLowerCase()} connect`;
+}
+
+function withInboundText(message: InboundMessage, text: string): InboundMessage {
+  if (!message.content || typeof message.content !== 'object' || Array.isArray(message.content)) return message;
+  return { ...message, content: { ...message.content, text } };
+}
+
+async function sendTelegramMessage(token: string, platformId: string, body: Record<string, unknown>): Promise<void> {
   const chatId = platformId.split(':').slice(1).join(':');
   if (!chatId) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: 'Pairing success! Head back to the NanoClaw installer to finish setup.',
-      }),
+      body: JSON.stringify({ chat_id: chatId, ...body }),
     });
     if (!res.ok) {
-      log.warn('Telegram pairing confirmation non-OK', { status: res.status });
+      log.warn('Telegram sendMessage non-OK', { status: res.status });
     }
   } catch (err) {
-    log.warn('Telegram pairing confirmation failed', { err });
+    log.warn('Telegram sendMessage failed', { err });
   }
 }
 
-function createPairingInterceptor(
+function sendConnectGroupReply(token: string, platformId: string, text: string, botUsername?: string): Promise<void> {
+  return sendTelegramMessage(token, platformId, {
+    text,
+    ...(botUsername
+      ? {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: 'Add me to a group',
+                  url: `https://t.me/${encodeURIComponent(botUsername)}?startgroup=connect`,
+                },
+              ],
+            ],
+          },
+        }
+      : {}),
+  });
+}
+
+async function handleConnectGroupCommand(
+  token: string,
+  platformId: string,
+  authorUserId: string | null,
+  knownBotUsername: string | null,
+): Promise<string | null> {
+  const userId = authorUserId ? `telegram:${authorUserId}` : null;
+  const isAuthorized = userId ? (await isOwner(userId)) || (await isGlobalAdmin(userId)) : false;
+
+  if (!isAuthorized) {
+    log.warn('Telegram connect-group command denied', { userId, platformId });
+    await sendConnectGroupReply(token, platformId, 'Only a NanoClaw owner or global admin can connect a group.');
+    return null;
+  }
+
+  // Startup's best-effort lookup may have failed transiently. Retry only when
+  // this command actually needs the username; normal inbound stays unchanged.
+  const botUsername = knownBotUsername ?? (await fetchBotUsername(token));
+  if (!botUsername) {
+    await sendConnectGroupReply(
+      token,
+      platformId,
+      "I couldn't open Telegram's group picker right now. Please try /connect_group again.",
+    );
+    return null;
+  }
+
+  await sendConnectGroupReply(
+    token,
+    platformId,
+    'First, make sure Group Privacy is off in BotFather (changing it requires removing and re-adding me). Then choose a group below and approve the registration card when it arrives.',
+    botUsername,
+  );
+  return botUsername;
+}
+
+/**
+ * Send a one-shot confirmation back to the paired chat. Best-effort — failures
+ * are logged but never propagated, so a Telegram outage can't undo a successful
+ * pairing or trigger the interceptor's fail-open path.
+ */
+async function sendPairingConfirmation(token: string, platformId: string): Promise<void> {
+  await sendTelegramMessage(token, platformId, {
+    text: 'Pairing success! Head back to the NanoClaw installer to finish setup.',
+  });
+}
+
+/**
+ * `instanceKey` is this bot's registry key ('telegram' for the default bot,
+ * 'telegram-<name>' for a named one). Pairing and the messaging-group row are
+ * instance-exact: a code issued for one bot never pairs on another, and a
+ * chat paired on a named bot gets its own row instead of updating the
+ * default bot's.
+ */
+export function createTelegramInboundInterceptor(
   botUsernamePromise: Promise<string | null>,
   hostOnInbound: ChannelSetup['onInbound'],
   token: string,
+  instanceKey: string,
 ): ChannelSetup['onInbound'] {
   return async (platformId, threadId, message) => {
+    const { text, authorUserId } = readInboundFields(message);
+    const botUsername = await botUsernamePromise;
+
+    if (!isGroupPlatformId(platformId) && isConnectGroupCommand(text, botUsername)) {
+      try {
+        const resolvedBotUsername = await handleConnectGroupCommand(token, platformId, authorUserId, botUsername);
+        if (resolvedBotUsername) botUsernamePromise = Promise.resolve(resolvedBotUsername);
+      } catch (err) {
+        // A recognized host command is consumed even when authorization or DB
+        // access fails; forwarding it would turn a denied control action into
+        // an ordinary agent prompt.
+        log.error('Telegram connect-group command failed', { err, platformId, authorUserId });
+      }
+      return;
+    }
+
+    if (isGroupPlatformId(platformId) && isStartGroupConnectCommand(text, botUsername)) {
+      await hostOnInbound(
+        platformId,
+        threadId,
+        withInboundText(
+          message,
+          'This Telegram group was just connected. Follow the welcome skill exactly: introduce yourself in this group first, then begin onboarding. Send every response back to this same group.',
+        ),
+      );
+      return;
+    }
+
     try {
-      const botUsername = await botUsernamePromise;
       if (!botUsername) {
         hostOnInbound(platformId, threadId, message);
         return;
       }
-      const { text, authorUserId } = readInboundFields(message);
       if (!text) {
         hostOnInbound(platformId, threadId, message);
         return;
@@ -143,6 +380,7 @@ function createPairingInterceptor(
         platformId,
         isGroup: isGroupPlatformId(platformId),
         adminUserId: authorUserId,
+        instance: instanceKey,
       });
       if (!consumed) {
         hostOnInbound(platformId, threadId, message);
@@ -152,16 +390,17 @@ function createPairingInterceptor(
       // code-bearing message never reaches an agent. Privilege is now a
       // property of the paired user, not the chat: upsert the user, and if
       // this instance has no owner yet, promote them to owner.
-      const existing = getMessagingGroupByPlatform('telegram', platformId);
+      const existing = await getMessagingGroupByPlatform('telegram', platformId, instanceKey);
       if (existing) {
-        updateMessagingGroup(existing.id, {
+        await updateMessagingGroup(existing.id, {
           is_group: consumed.consumed!.isGroup ? 1 : 0,
         });
       } else {
-        createMessagingGroup({
+        await createMessagingGroup({
           id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           channel_type: 'telegram',
           platform_id: platformId,
+          instance: instanceKey,
           name: consumed.consumed!.name,
           is_group: consumed.consumed!.isGroup ? 1 : 0,
           // Same context-appropriate default as router auto-create, so a
@@ -173,7 +412,7 @@ function createPairingInterceptor(
       }
 
       const pairedUserId = `telegram:${consumed.consumed!.adminUserId}`;
-      upsertUser({
+      await upsertUser({
         id: pairedUserId,
         kind: 'telegram',
         display_name: null,
@@ -181,8 +420,8 @@ function createPairingInterceptor(
       });
 
       let promotedToOwner = false;
-      if (!hasAnyOwner()) {
-        grantRole({
+      if (!(await hasAnyOwner())) {
+        await grantRole({
           user_id: pairedUserId,
           role: 'owner',
           agent_group_id: null,
@@ -194,6 +433,7 @@ function createPairingInterceptor(
 
       log.info('Telegram pairing accepted — chat registered', {
         platformId,
+        instance: instanceKey,
         pairedUser: pairedUserId,
         promotedToOwner,
         intent: consumed.intent,
@@ -208,96 +448,146 @@ function createPairingInterceptor(
   };
 }
 
+/**
+ * Bot id (the part of a token before ':') to the instance key that claimed
+ * it. Telegram allows one getUpdates poller per bot (a second one gets 409
+ * conflicts), so a name whose bot another instance already holds is skipped
+ * at the factory. Keyed by bot id so this module-level map never holds a
+ * secret.
+ */
+const claimedBotIds = new Map<string, string>();
+
+/** Construction knobs for one Telegram bot identity. */
+export interface TelegramBridgeOptions {
+  /**
+   * Uppercased/underscored instance suffix appended to the token env key
+   * after an underscore: 'GH_BOT' reads TELEGRAM_BOT_TOKEN_GH_BOT. Omit for
+   * the default bot's unsuffixed key.
+   */
+  envKeySuffix?: string;
+  /**
+   * Registry/bridge instance key (e.g. 'telegram-gh-bot'). Omit for the
+   * default instance, keyed by channelType.
+   */
+  instanceKey?: string;
+}
+
+/**
+ * Build one Telegram bot identity's bridge from its token. The default bot is
+ * the zero-suffix call (used by the registration below); named instances pass
+ * a suffix + instance key and get the exact same construction: polling
+ * adapter, pairing interceptor, channel-name resolution, TELEGRAM_DEFAULTS
+ * declaration. Returns null when the token is missing (or its bot is already
+ * claimed by another instance) so the registry surfaces its normal
+ * "credentials missing, skipping" warning.
+ */
+export function createTelegramBridge(options: TelegramBridgeOptions = {}): ChannelAdapter | null {
+  const tokenKey = `TELEGRAM_BOT_TOKEN${options.envKeySuffix ? `_${options.envKeySuffix}` : ''}`;
+  const token = readEnvFile([tokenKey])[tokenKey];
+  if (!token) return null;
+  const instanceKey = options.instanceKey ?? 'telegram';
+  const botId = token.split(':')[0];
+  const holder = claimedBotIds.get(botId);
+  if (holder !== undefined && holder !== instanceKey) {
+    log.warn('Telegram bot token already in use by another instance, skipping', { instance: instanceKey, holder });
+    return null;
+  }
+  claimedBotIds.set(botId, instanceKey);
+  const telegramAdapter = createTelegramAdapter({
+    botToken: token,
+    mode: 'polling',
+  });
+  keepCommandsAsMessages(telegramAdapter);
+  markVoiceNotes(telegramAdapter);
+  refuseCutCards(telegramAdapter);
+  const bridge = createChatSdkBridge({
+    // refuseCutCards owns title encoding before measuring the actual wire text.
+    ...{ escapeCardTitle: (title: string) => title },
+    adapter: telegramAdapter,
+    instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
+    concurrency: 'concurrent',
+    extractReplyContext,
+    supportsThreads: false,
+    defaults: TELEGRAM_DEFAULTS,
+    // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
+    // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
+    // sanitizer this replaced was written for the old converter and, run in
+    // front of the new one, downgraded **bold** to *single-star* — which the
+    // adapter then parsed as emphasis and rendered as _italic_.
+    maxTextLength: 4000,
+    // The agent's own question cap. MarkdownV2 escaping at most doubles plain
+    // text, so a card under it stays within Telegram's 4,096; text that grows
+    // more is refused by refuseCutCards. Spread, so an older core without this
+    // option still type-checks (and ignores it).
+    ...{ maxCardTextLength: 2000 },
+  });
+
+  const botUsernamePromise = fetchBotUsername(token);
+
+  const wrapped: ChannelAdapter = {
+    ...bridge,
+    resolveChannelName: async (platformId: string) => {
+      const chatId = platformId.split(':').slice(1).join(':');
+      if (!chatId) return null;
+      try {
+        const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId }),
+        });
+        const data = (await res.json()) as { ok?: boolean; result?: { title?: string } };
+        return data.ok ? (data.result?.title ?? null) : null;
+      } catch {
+        return null;
+      }
+    },
+    async setup(hostConfig: ChannelSetup) {
+      const intercepted: ChannelSetup = {
+        ...hostConfig,
+        onInbound: createTelegramInboundInterceptor(
+          botUsernamePromise,
+          flagVoiceNotes(hostConfig.onInbound),
+          token,
+          instanceKey,
+        ),
+      };
+      return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
+    },
+  };
+  return wrapped;
+}
+
+/** Env-key suffix for a named instance: uppercased, dashes to underscores. */
+function instanceEnvKeySuffix(name: string): string {
+  return name.toUpperCase().replace(/-/g, '_');
+}
+
+/** Named-instance entry into createTelegramBridge; exported for the registration test. */
+export function telegramInstanceBridgeFactory(name: string): ChannelAdapter | null {
+  return createTelegramBridge({ envKeySuffix: instanceEnvKeySuffix(name), instanceKey: `telegram-${name}` });
+}
+
 registerChannelAdapter('telegram', {
-  factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
-    if (!env.TELEGRAM_BOT_TOKEN) return null;
-    const token = env.TELEGRAM_BOT_TOKEN;
-    const telegramAdapter = createTelegramAdapter({
-      botToken: token,
-      mode: 'polling',
-    });
-    const bridge = createChatSdkBridge({
-      adapter: telegramAdapter,
-      concurrency: 'concurrent',
-      extractReplyContext,
-      supportsThreads: false,
-      defaults: TELEGRAM_DEFAULTS,
-      // No transformOutboundText: @chat-adapter/telegram >= 4.29 parses
-      // CommonMark and renders escaped MarkdownV2 itself. The legacy-Markdown
-      // sanitizer this replaced was written for the old converter and, run in
-      // front of the new one, downgraded **bold** to *single-star* — which the
-      // adapter then parsed as emphasis and rendered as _italic_.
-      maxTextLength: 4000,
-    });
-
-    const botUsernamePromise = fetchBotUsername(token);
-
-    const wrapped: ChannelAdapter = {
-      ...bridge,
-      // Plain-text fallback: @chat-adapter/telegram renders replies as MarkdownV2,
-      // and Telegram rejects the whole send with a 400 "can't parse entities" when
-      // the agent's text produces an unbalanced entity (a stray * _ [ or an
-      // unterminated URL). Without this, such a reply is retried 3x and then
-      // silently dropped — the user sees nothing. On that specific error we resend
-      // the raw text with no parse_mode so the message still lands (markdown marks
-      // show literally). Only single-chunk messages hit this in practice; a
-      // >maxTextLength multi-chunk body could re-send an already-delivered chunk
-      // here, which is acceptable for a last-resort path. Non-entity errors rethrow
-      // untouched so real failures still surface.
-      async deliver(platformId: string, threadId: string | null, message: OutboundMessage) {
-        try {
-          return await bridge.deliver(platformId, threadId, message);
-        } catch (err) {
-          const errMsg = String((err as { message?: unknown } | undefined)?.message ?? err ?? '');
-          if (!/can'?t parse entities/i.test(errMsg)) throw err;
-          const text = (message.content as { text?: string } | null | undefined)?.text;
-          if (!text) throw err;
-          const chatId = platformId.split(':').slice(1).join(':');
-          const body: Record<string, unknown> = { chat_id: chatId, text };
-          const threadNum = threadId ? Number(threadId) : NaN;
-          if (Number.isFinite(threadNum)) body.message_thread_id = threadNum;
-          const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          const data = (await res.json()) as { ok?: boolean; result?: { message_id?: number } };
-          if (!data.ok) {
-            log.error('Telegram plain-text fallback failed after markdown rejection', { chatId });
-            throw err;
-          }
-          log.warn('Telegram rejected markdown; delivered as plain text', {
-            chatId,
-            droppedFiles: message.files?.length ?? 0,
-          });
-          return data.result?.message_id != null ? String(data.result.message_id) : undefined;
-        }
-      },
-      resolveChannelName: async (platformId: string) => {
-        const chatId = platformId.split(':').slice(1).join(':');
-        if (!chatId) return null;
-        try {
-          const res = await fetch(`https://api.telegram.org/bot${token}/getChat`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId }),
-          });
-          const data = (await res.json()) as { ok?: boolean; result?: { title?: string } };
-          return data.ok ? (data.result?.title ?? null) : null;
-        } catch {
-          return null;
-        }
-      },
-      async setup(hostConfig: ChannelSetup) {
-        const intercepted: ChannelSetup = {
-          ...hostConfig,
-          onInbound: createPairingInterceptor(botUsernamePromise, hostConfig.onInbound, token),
-        };
-        return withRetry(() => bridge.setup(intercepted), 'bridge.setup');
-      },
-    };
-    return wrapped;
-  },
+  factory: () => createTelegramBridge(),
   defaults: TELEGRAM_DEFAULTS,
 });
+
+// Named instances: registration is unconditional for every listed name (a
+// missing token is then reported at boot instead of leaving a bot silently
+// absent), and every registration carries the same TELEGRAM_DEFAULTS
+// declaration as the default bot, so offline creation paths (setup, ncl)
+// resolve declared wiring defaults for named instances too. Names are
+// lowercase kebab so the env-key mapping is one-to-one and the instance key
+// is URL-safe for the bridge.
+for (const raw of (readEnvFile(['TELEGRAM_INSTANCES']).TELEGRAM_INSTANCES ?? '').split(',')) {
+  const name = raw.trim();
+  if (!name) continue;
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+    log.warn('TELEGRAM_INSTANCES name must match ^[a-z0-9][a-z0-9-]*$, skipping', { name });
+    continue;
+  }
+  registerChannelAdapter(`telegram-${name}`, {
+    factory: () => telegramInstanceBridgeFactory(name),
+    defaults: TELEGRAM_DEFAULTS,
+  });
+}

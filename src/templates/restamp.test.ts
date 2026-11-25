@@ -20,14 +20,15 @@ vi.mock('../log.js', () => ({
 }));
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { AnchoredDir } from '../anchored-dir.js';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigJson } from '../db/container-configs.js';
 import { configFromDb, type McpServerConfig } from '../container-config.js';
 import { findTaskSessions } from '../db/sessions.js';
 import { PERSONA_PREPEND_FILE } from '../group-persona.js';
 import { createScheduledTask, prepareScheduledTask } from '../modules/scheduling/create.js';
-import { resumeTask } from '../modules/scheduling/db.js';
-import { inboundDbPath, withInboundDb } from '../session-manager.js';
+import { resumeTask } from '../mailbox/sqlite/tasks.js';
+import { inboundDbPath } from '../mailbox/sqlite/paths.js';
 import type { AgentGroup } from '../types.js';
 import { NANOCLAW_EXTENSION_NS } from './extension.js';
 import { MCP_SCHEMA_URL, PLUGIN_SCHEMA_URL } from './manifest.js';
@@ -35,6 +36,15 @@ import { createAgentFromTemplate } from './create-agent.js';
 import { restampAgentFromTemplate, type RestampChange } from './restamp.js';
 
 const TPL = path.join(TEMPLATES_DIR, 'sales', 'sdr');
+
+function withInboundDb<T>(agentGroupId: string, sessionId: string, action: (db: Database.Database) => T): T {
+  const db = new Database(inboundDbPath(agentGroupId, sessionId));
+  try {
+    return action(db);
+  } finally {
+    db.close();
+  }
+}
 
 /** The v1 template every test stamps from. */
 function writeTemplateV1(): void {
@@ -96,13 +106,15 @@ function writeTask(name: string, schedule: string, prompt: string): void {
   fs.writeFileSync(path.join(dir, `${name}.md`), `---\nschedule: "${schedule}"\n---\n\n${prompt}\n`);
 }
 
-function servers(groupId: string): Record<string, McpServerConfig> {
-  return JSON.parse(getContainerConfig(groupId)!.mcp_servers) as Record<string, McpServerConfig>;
+async function servers(groupId: string): Promise<Record<string, McpServerConfig>> {
+  return JSON.parse((await getContainerConfig(groupId))!.mcp_servers) as Record<string, McpServerConfig>;
 }
 
-function liveTasks(groupId: string): Array<{ series_id: string; status: string; recurrence: string; prompt: string }> {
+async function liveTasks(
+  groupId: string,
+): Promise<Array<{ series_id: string; status: string; recurrence: string; prompt: string }>> {
   const rows: Array<{ series_id: string; status: string; recurrence: string; prompt: string }> = [];
-  for (const session of findTaskSessions(groupId)) {
+  for (const session of await findTaskSessions(groupId)) {
     const db = new Database(inboundDbPath(groupId, session.id), { readonly: true });
     for (const row of db
       .prepare(
@@ -117,9 +129,9 @@ function liveTasks(groupId: string): Array<{ series_id: string; status: string; 
 }
 
 /** Every task series id in the group, across all rows regardless of status. */
-function allTaskSeries(groupId: string): string[] {
+async function allTaskSeries(groupId: string): Promise<string[]> {
   const ids = new Set<string>();
-  for (const session of findTaskSessions(groupId)) {
+  for (const session of await findTaskSessions(groupId)) {
     const db = new Database(inboundDbPath(groupId, session.id), { readonly: true });
     for (const row of db.prepare("SELECT DISTINCT series_id FROM messages_in WHERE kind = 'task'").all() as Array<{
       series_id: string;
@@ -137,36 +149,54 @@ function change(changes: RestampChange[], surface: RestampChange['surface'], nam
   return found!;
 }
 
-function stamp(): AgentGroup {
-  return createAgentFromTemplate('sales/sdr', { name: 'SDR' }).group;
+async function stamp(): Promise<AgentGroup> {
+  return (await createAgentFromTemplate('sales/sdr', { name: 'SDR' })).group;
 }
 
 const overlaySkill = (groupId: string, skill: string): string =>
   path.join(DATA_DIR, 'v2-sessions', groupId, '.claude-shared', 'skills', skill, 'SKILL.md');
 
-beforeEach(() => {
+/** Replace the directory's path after apply has pinned it, before it uses the returned handle. */
+function replaceDirectoryAfterOpen(directory: string, outside: string): string {
+  const moved = `${directory}-moved`;
+  const openDir = AnchoredDir.prototype.openDir;
+  let replaced = false;
+  vi.spyOn(AnchoredDir.prototype, 'openDir').mockImplementation(function (this: AnchoredDir, name, create) {
+    const dir = openDir.call(this, name, create);
+    if (!replaced && dir && name === path.basename(directory)) {
+      replaced = true;
+      fs.renameSync(directory, moved);
+      fs.symlinkSync(outside, directory);
+    }
+    return dir;
+  });
+  return moved;
+}
+
+beforeEach(async () => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
-  runMigrations(initTestDb());
+  await runMigrations(await initTestDb());
   writeTemplateV1();
 });
 
-afterEach(() => {
-  closeDb();
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
 describe('plugin ownership marker', () => {
-  it('stamps the plugin marker on every server and pluginRoot on stdio only', () => {
-    const g = stamp();
-    const s = servers(g.id);
+  it('stamps the plugin marker on every server and pluginRoot on stdio only', async () => {
+    const g = await stamp();
+    const s = await servers(g.id);
     expect(s.hubspot).toMatchObject({ plugin: 'sdr', pluginRoot: '/workspace/agent/plugins/sdr' });
     expect(s.docs).toEqual({ type: 'http', url: 'https://mcp.example.com/mcp', plugin: 'sdr' });
   });
 
-  it('never ships the marker to the container config', () => {
-    const g = stamp();
-    const config = configFromDb(getContainerConfig(g.id)!, g);
+  it('never ships the marker to the container config', async () => {
+    const g = await stamp();
+    const config = configFromDb((await getContainerConfig(g.id))!, g);
     expect(config.mcpServers.hubspot).not.toHaveProperty('plugin');
     expect(config.mcpServers.hubspot).toHaveProperty('pluginRoot');
     expect(config.mcpServers.docs).toEqual({ type: 'http', url: 'https://mcp.example.com/mcp' });
@@ -174,7 +204,7 @@ describe('plugin ownership marker', () => {
 });
 
 describe('restampAgentFromTemplate', () => {
-  it('throws when the group does not carry the plugin', () => {
+  it('throws when the group does not carry the plugin', async () => {
     const g: AgentGroup = {
       id: 'ag-bare',
       name: 'Bare',
@@ -182,54 +212,59 @@ describe('restampAgentFromTemplate', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     };
-    createAgentGroup(g);
-    ensureContainerConfig(g.id);
-    expect(() => restampAgentFromTemplate('sales/sdr', g.id, { apply: false })).toThrow(/does not carry plugin "sdr"/);
+    await createAgentGroup(g);
+    await ensureContainerConfig(g.id);
+    await expect(restampAgentFromTemplate('sales/sdr', g.id, { apply: false })).rejects.toThrow(
+      /does not carry plugin "sdr"/,
+    );
   });
 
-  it('reports all-unchanged when the template did not change', () => {
-    const g = stamp();
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+  it('reports all-unchanged when the template did not change', async () => {
+    const g = await stamp();
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
     expect(result.changes.every((c) => c.action === 'unchanged')).toBe(true);
     expect(result.note).toMatch(/Nothing to apply/);
   });
 
-  it('treats an exec-bit-only template change as an update', () => {
+  it('treats an exec-bit-only template change as an update', async () => {
     // The copier preserves the executable bit, so a chmod-only revision must
     // ship on restamp instead of comparing as byte-identical.
-    const g = stamp();
+    const g = await stamp();
     fs.chmodSync(path.join(TPL, 'plugin.json'), 0o755);
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
     expect(result.changes.find((c) => c.surface === 'plugin')?.action).toBe('update');
   });
 
-  it('recreates a missing ${PLUGIN_DATA} cwd dir even when plugin files are unchanged', () => {
-    // The adoption path: same template ref, but the dir is absent (an older
-    // engine skipped cwd servers at stamp time, or the agent deleted it).
-    // plugin-data scaffold must heal without a plugin-file diff.
-    fs.writeFileSync(
-      path.join(TPL, 'mcp.json'),
-      JSON.stringify({
-        $schema: MCP_SCHEMA_URL,
-        mcpServers: { hubspot: { type: 'stdio', command: 'npx', cwd: '${PLUGIN_DATA}/state' } },
-      }),
-    );
-    const g = stamp();
-    const stateDir = path.join(GROUPS_DIR, g.folder, 'plugin-data', 'sdr', 'state');
-    fs.rmSync(stateDir, { recursive: true });
+  it.each(['state', 'state/./work', '.', ''])(
+    'recreates a missing ${PLUGIN_DATA}/%s cwd dir even when plugin files are unchanged',
+    async (sub) => {
+      // The adoption path: same template ref, but the dir is absent (an older
+      // engine skipped cwd servers at stamp time, or the agent deleted it).
+      // plugin-data scaffold must heal without a plugin-file diff.
+      fs.writeFileSync(
+        path.join(TPL, 'mcp.json'),
+        JSON.stringify({
+          $schema: MCP_SCHEMA_URL,
+          mcpServers: { hubspot: { type: 'stdio', command: 'npx', cwd: '${PLUGIN_DATA}/' + sub } },
+        }),
+      );
+      const g = await stamp();
+      const stateDir = path.join(GROUPS_DIR, g.folder, 'plugin-data', 'sdr', sub);
+      fs.rmSync(stateDir, { recursive: true });
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+      const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
-    expect(result.changes.find((c) => c.surface === 'plugin')?.action).toBe('unchanged');
-    expect(fs.existsSync(stateDir)).toBe(true);
-  });
+      expect(result.changes.find((c) => c.surface === 'plugin')?.action).toBe('unchanged');
+      expect(fs.existsSync(stateDir)).toBe(true);
+    },
+  );
 
-  it('dry run reports every change but mutates nothing', () => {
-    const g = stamp();
+  it('dry run reports every change but mutates nothing', async () => {
+    const g = await stamp();
     const groupDir = path.join(GROUPS_DIR, g.folder);
     writeTemplateV2();
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
 
     expect(result.applied).toBe(false);
     expect(change(result.changes, 'persona', PERSONA_PREPEND_FILE).action).toBe('update');
@@ -248,32 +283,32 @@ describe('restampAgentFromTemplate', () => {
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('You are an SDR agent.\n');
     expect(fs.existsSync(path.join(groupDir, 'additional_context', 'faq.md'))).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'guide.md'))).toBe(false);
-    expect(servers(g.id).docs).toBeDefined();
-    expect(servers(g.id).search).toBeUndefined();
-    expect(liveTasks(g.id)).toHaveLength(1);
+    expect((await servers(g.id)).docs).toBeDefined();
+    expect((await servers(g.id)).search).toBeUndefined();
+    expect(await liveTasks(g.id)).toHaveLength(1);
     expect(fs.readFileSync(path.join(groupDir, 'plugins', 'sdr', 'TROUBLESHOOTING.md'), 'utf-8')).toContain('v1');
   });
 
-  it('applies the full update across every plugin-owned surface', () => {
-    const g = stamp();
+  it('applies the full update across every plugin-owned surface', async () => {
+    const g = await stamp();
     const groupDir = path.join(GROUPS_DIR, g.folder);
     // Operator state that must survive: a user-added server, a workspace file,
     // an agent-authored overlay skill, plugin-data content, a resumed task.
-    updateContainerConfigJson(g.id, 'mcp_servers', {
-      ...servers(g.id),
+    await updateContainerConfigJson(g.id, 'mcp_servers', {
+      ...(await servers(g.id)),
       mine: { type: 'http', url: 'https://mine.example.com/mcp' },
     });
     fs.writeFileSync(path.join(groupDir, 'notes.md'), 'agent notes\n');
     fs.mkdirSync(path.dirname(overlaySkill(g.id, 'own')), { recursive: true });
     fs.writeFileSync(overlaySkill(g.id, 'own'), '---\nname: own\ndescription: agent made\n---\n');
     fs.writeFileSync(path.join(groupDir, 'plugin-data', 'sdr', 'state.json'), '{"seen": 3}\n');
-    const series = liveTasks(g.id)[0].series_id;
-    for (const session of findTaskSessions(g.id)) {
+    const series = (await liveTasks(g.id))[0].series_id;
+    for (const session of await findTaskSessions(g.id)) {
       withInboundDb(g.id, session.id, (db) => resumeTask(db, series));
     }
     writeTemplateV2();
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(result.applied).toBe(true);
     expect(result.note).toMatch(/groups restart/);
@@ -289,7 +324,7 @@ describe('restampAgentFromTemplate', () => {
     expect(fs.existsSync(overlaySkill(g.id, 'lookup'))).toBe(true);
     expect(fs.existsSync(overlaySkill(g.id, 'own'))).toBe(true);
     // MCP: plugin set swapped, user server untouched.
-    const s = servers(g.id);
+    const s = await servers(g.id);
     expect(s.hubspot).toMatchObject({ args: ['-y', '@hubspot/mcp-server@2'], plugin: 'sdr' });
     expect(s.docs).toBeUndefined();
     expect(s.search).toMatchObject({ type: 'http', plugin: 'sdr' });
@@ -298,7 +333,7 @@ describe('restampAgentFromTemplate', () => {
     expect(fs.readFileSync(path.join(groupDir, 'notes.md'), 'utf-8')).toBe('agent notes\n');
     expect(fs.readFileSync(path.join(groupDir, 'plugin-data', 'sdr', 'state.json'), 'utf-8')).toBe('{"seen": 3}\n');
     // Tasks: definition updated in place, resumed status kept; new task paused.
-    const tasks = liveTasks(g.id);
+    const tasks = await liveTasks(g.id);
     const briefing = tasks.find((t) => t.series_id === series)!;
     expect(briefing.status).toBe('pending');
     expect(briefing.recurrence).toBe('0 8 * * 1-5');
@@ -307,43 +342,43 @@ describe('restampAgentFromTemplate', () => {
     expect(report.status).toBe('paused');
   });
 
-  it('flags locally customized files and resets them on apply', () => {
-    const g = stamp();
+  it('flags locally customized files and resets them on apply', async () => {
+    const g = await stamp();
     const groupDir = path.join(GROUPS_DIR, g.folder);
     fs.writeFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'My hand-tuned persona.\n');
     fs.writeFileSync(path.join(groupDir, 'playbook.md'), '# My playbook\n');
     fs.writeFileSync(overlaySkill(g.id, 'widget'), '---\nname: widget\ndescription: my tweak\n---\n');
     writeTemplateV2();
 
-    const plan = restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
+    const plan = await restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
     expect(change(plan.changes, 'persona', PERSONA_PREPEND_FILE).customized).toBe(true);
     expect(change(plan.changes, 'context', 'playbook.md').customized).toBe(true);
     expect(change(plan.changes, 'skill', 'widget').customized).toBe(true);
     // Unmodified surfaces are not flagged.
     expect(change(plan.changes, 'context', 'guide.md').customized).toBeUndefined();
 
-    restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
     expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('You are an SDR agent v2.\n');
     expect(fs.readFileSync(path.join(groupDir, 'playbook.md'), 'utf-8')).toBe('# Playbook v2\n');
     expect(fs.readFileSync(overlaySkill(g.id, 'widget'), 'utf-8')).toContain('v2');
   });
 
-  it('never clobbers a user-added server whose name a new plugin server takes', () => {
-    const g = stamp();
-    updateContainerConfigJson(g.id, 'mcp_servers', {
-      ...servers(g.id),
+  it('never clobbers a user-added server whose name a new plugin server takes', async () => {
+    const g = await stamp();
+    await updateContainerConfigJson(g.id, 'mcp_servers', {
+      ...(await servers(g.id)),
       search: { type: 'http', url: 'https://mine.example.com/mcp' },
     });
     writeTemplateV2();
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(change(result.changes, 'mcp-server', 'search').action).toBe('skip');
-    expect(servers(g.id).search).toEqual({ type: 'http', url: 'https://mine.example.com/mcp' });
+    expect((await servers(g.id)).search).toEqual({ type: 'http', url: 'https://mine.example.com/mcp' });
   });
 
-  it('neutralizes planted file symlinks instead of writing through them', () => {
-    const g = stamp();
+  it('neutralizes planted file symlinks instead of writing through them', async () => {
+    const g = await stamp();
     const groupDir = path.join(GROUPS_DIR, g.folder);
     const victim = path.join(TEST_ROOT, 'victim.txt');
     fs.writeFileSync(victim, 'precious\n');
@@ -353,7 +388,7 @@ describe('restampAgentFromTemplate', () => {
     fs.symlinkSync(victim, path.join(groupDir, 'playbook.md'));
     writeTemplateV2();
 
-    restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(fs.readFileSync(victim, 'utf-8')).toBe('precious\n');
     expect(fs.lstatSync(path.join(groupDir, PERSONA_PREPEND_FILE)).isSymbolicLink()).toBe(false);
@@ -361,8 +396,8 @@ describe('restampAgentFromTemplate', () => {
     expect(fs.readFileSync(path.join(groupDir, 'playbook.md'), 'utf-8')).toBe('# Playbook v2\n');
   });
 
-  it('refuses to write context through a symlinked directory', () => {
-    const g = stamp();
+  it('refuses to write context through a symlinked directory', async () => {
+    const g = await stamp();
     const groupDir = path.join(GROUPS_DIR, g.folder);
     const outside = path.join(TEST_ROOT, 'outside');
     fs.mkdirSync(outside, { recursive: true });
@@ -374,12 +409,12 @@ describe('restampAgentFromTemplate', () => {
     fs.mkdirSync(extraDir, { recursive: true });
     fs.writeFileSync(path.join(extraDir, 'faq.md'), '# FAQ v2\n');
 
-    expect(() => restampAgentFromTemplate('sales/sdr', g.id, { apply: true })).toThrow(/resolves outside/);
+    await expect(restampAgentFromTemplate('sales/sdr', g.id, { apply: true })).rejects.toThrow(/not a real directory/);
     expect(fs.existsSync(path.join(outside, 'faq.md'))).toBe(false);
   });
 
-  it('refuses to write skills through a symlinked overlay root', () => {
-    const g = stamp();
+  it('refuses to write skills through a symlinked overlay root', async () => {
+    const g = await stamp();
     const outside = path.join(TEST_ROOT, 'outside-skills');
     fs.mkdirSync(outside, { recursive: true });
     const overlayRoot = path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills');
@@ -387,48 +422,153 @@ describe('restampAgentFromTemplate', () => {
     fs.symlinkSync(outside, overlayRoot);
     writeTemplateV2();
 
-    expect(() => restampAgentFromTemplate('sales/sdr', g.id, { apply: true })).toThrow(/resolves outside/);
+    await expect(restampAgentFromTemplate('sales/sdr', g.id, { apply: true })).rejects.toThrow(/not a real directory/);
     expect(fs.existsSync(path.join(outside, 'widget'))).toBe(false);
   });
 
-  it('plans over a dangling symlink in the overlay without crashing', () => {
-    const g = stamp();
+  it.each(['create', 'update', 'remove'] as const)(
+    'keeps a context %s inside the opened group directory when its path changes',
+    async (action) => {
+      const g = await stamp();
+      const directory = path.join(GROUPS_DIR, g.folder, 'additional_context');
+      const source = path.join(TPL, NANOCLAW_EXTENSION_NS, 'context', 'additional_context');
+      const name = action === 'create' ? 'guide.md' : 'faq.md';
+      if (action === 'remove') fs.rmSync(path.join(source, name));
+      else fs.writeFileSync(path.join(source, name), '# Updated context\n');
+      const outside = path.join(TEST_ROOT, 'outside-context');
+      fs.mkdirSync(outside);
+      fs.writeFileSync(path.join(outside, 'faq.md'), 'outside FAQ');
+      fs.writeFileSync(path.join(outside, 'keep'), 'keep');
+      const moved = replaceDirectoryAfterOpen(directory, outside);
+
+      const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+
+      expect(change(result.changes, 'context', `additional_context/${name}`).action).toBe(action);
+      expect(fs.lstatSync(directory).isSymbolicLink()).toBe(true);
+      expect(fs.readdirSync(outside)).toEqual(['faq.md', 'keep']);
+      expect(fs.readFileSync(path.join(outside, 'faq.md'), 'utf-8')).toBe('outside FAQ');
+      expect(fs.readFileSync(path.join(outside, 'keep'), 'utf-8')).toBe('keep');
+      if (action === 'remove') expect(fs.existsSync(path.join(moved, name))).toBe(false);
+      else expect(fs.readFileSync(path.join(moved, name), 'utf-8')).toBe('# Updated context\n');
+    },
+  );
+
+  it.each(['create', 'update', 'remove'] as const)(
+    'keeps a skill %s inside the opened overlay when its path changes',
+    async (action) => {
+      const g = await stamp();
+      const directory = path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills');
+      const name = action === 'create' ? 'lookup' : 'widget';
+      if (action === 'remove') fs.rmSync(path.join(TPL, 'skills', name), { recursive: true });
+      else {
+        writeSkill(TPL, name, 'updated skill');
+        fs.mkdirSync(path.join(TPL, 'skills', name, 'scripts'));
+        fs.writeFileSync(path.join(TPL, 'skills', name, 'scripts', 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
+      }
+      const outside = path.join(TEST_ROOT, 'outside-overlay');
+      fs.mkdirSync(path.join(outside, 'widget'), { recursive: true });
+      fs.writeFileSync(path.join(outside, 'widget', 'SKILL.md'), 'outside skill');
+      fs.writeFileSync(path.join(outside, 'keep'), 'keep');
+      const moved = replaceDirectoryAfterOpen(directory, outside);
+
+      const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+
+      expect(change(result.changes, 'skill', name).action).toBe(action);
+      expect(fs.lstatSync(directory).isSymbolicLink()).toBe(true);
+      expect(fs.readdirSync(outside)).toEqual(['keep', 'widget']);
+      expect(fs.readdirSync(path.join(outside, 'widget'))).toEqual(['SKILL.md']);
+      expect(fs.readFileSync(path.join(outside, 'widget', 'SKILL.md'), 'utf-8')).toBe('outside skill');
+      expect(fs.readFileSync(path.join(outside, 'keep'), 'utf-8')).toBe('keep');
+      if (action === 'remove') expect(fs.existsSync(path.join(moved, name))).toBe(false);
+      else {
+        expect(fs.readFileSync(path.join(moved, name, 'SKILL.md'), 'utf-8')).toContain('updated skill');
+        expect(fs.readFileSync(path.join(moved, name, 'scripts', 'run.sh'), 'utf-8')).toBe('#!/bin/sh\n');
+        expect(fs.statSync(path.join(moved, name, 'scripts', 'run.sh')).mode & 0o111).toBe(0o111);
+      }
+    },
+  );
+
+  it.each(['plugin-data', 'plugin-data/sdr'])(
+    'creates plugin-data scaffold inside the opened %s directory when its path changes',
+    async (relative) => {
+      fs.writeFileSync(
+        path.join(TPL, 'mcp.json'),
+        JSON.stringify({
+          $schema: MCP_SCHEMA_URL,
+          mcpServers: { hubspot: { type: 'stdio', command: 'npx', cwd: '${PLUGIN_DATA}/state/work' } },
+        }),
+      );
+      const g = await stamp();
+      const groupDir = path.join(GROUPS_DIR, g.folder);
+      fs.rmSync(path.join(groupDir, 'plugin-data', 'sdr', 'state'), { recursive: true });
+      const outside = path.join(TEST_ROOT, 'outside-data');
+      fs.mkdirSync(outside);
+      fs.writeFileSync(path.join(outside, 'keep'), 'keep');
+      const directory = path.join(groupDir, relative);
+      const moved = replaceDirectoryAfterOpen(directory, outside);
+
+      await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+
+      expect(fs.lstatSync(directory).isSymbolicLink()).toBe(true);
+      expect(fs.readdirSync(outside)).toEqual(['keep']);
+      expect(fs.readFileSync(path.join(outside, 'keep'), 'utf-8')).toBe('keep');
+      const scaffold =
+        relative === 'plugin-data' ? path.join(moved, 'sdr', 'state', 'work') : path.join(moved, 'state', 'work');
+      expect(fs.statSync(scaffold).isDirectory()).toBe(true);
+    },
+  );
+
+  it('refuses to create plugin-data scaffold through a symlinked directory', async () => {
+    const g = await stamp();
+    const directory = path.join(GROUPS_DIR, g.folder, 'plugin-data');
+    const outside = path.join(TEST_ROOT, 'outside-data');
+    fs.mkdirSync(outside);
+    fs.rmSync(directory, { recursive: true });
+    fs.symlinkSync(outside, directory);
+    writeTemplateV2();
+
+    await expect(restampAgentFromTemplate('sales/sdr', g.id, { apply: true })).rejects.toThrow(/not a real directory/);
+    expect(fs.readdirSync(outside)).toEqual([]);
+  });
+
+  it('plans over a dangling symlink in the overlay without crashing', async () => {
+    const g = await stamp();
     fs.symlinkSync(
       '/nonexistent-target',
       path.join(DATA_DIR, 'v2-sessions', g.id, '.claude-shared', 'skills', 'widget', 'ghost'),
     );
 
-    const plan = restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
+    const plan = await restampAgentFromTemplate('sales/sdr', g.id, { apply: false });
     expect(change(plan.changes, 'skill', 'widget').action).toBe('unchanged');
   });
 
-  it('skips instead of duplicating a series that is re-arming between runs', () => {
-    const g = stamp();
-    const series = liveTasks(g.id)[0].series_id;
+  it('skips instead of duplicating a series that is re-arming between runs', async () => {
+    const g = await stamp();
+    const series = (await liveTasks(g.id))[0].series_id;
     // Simulate the ≤60s window: the run completed, the sweep has not re-armed
     // the next occurrence yet (recurrence still set on the completed row).
-    for (const session of findTaskSessions(g.id)) {
+    for (const session of await findTaskSessions(g.id)) {
       withInboundDb(g.id, session.id, (db) =>
         db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = ?").run(series),
       );
     }
     writeTemplateV2();
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     const row = change(result.changes, 'task', 'weekday-briefing');
     expect(row.action).toBe('skip');
     expect(row.note).toMatch(/re-arming/);
     // No duplicate series was created for the briefing; the new template task was.
-    const seriesIds = allTaskSeries(g.id).filter((id) => id.startsWith('weekday-briefing-'));
+    const seriesIds = (await allTaskSeries(g.id)).filter((id) => id.startsWith('weekday-briefing-'));
     expect(seriesIds).toEqual([series]);
-    expect(liveTasks(g.id).some((t) => t.series_id.startsWith('weekly-report-'))).toBe(true);
+    expect((await liveTasks(g.id)).some((t) => t.series_id.startsWith('weekly-report-'))).toBe(true);
   });
 
-  it('deletes a dropped series even while it is re-arming', () => {
-    const g = stamp();
-    const series = liveTasks(g.id)[0].series_id;
-    for (const session of findTaskSessions(g.id)) {
+  it('deletes a dropped series even while it is re-arming', async () => {
+    const g = await stamp();
+    const series = (await liveTasks(g.id))[0].series_id;
+    for (const session of await findTaskSessions(g.id)) {
       withInboundDb(g.id, session.id, (db) =>
         db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = ?").run(series),
       );
@@ -436,68 +576,68 @@ describe('restampAgentFromTemplate', () => {
     writeTemplateV2();
     fs.rmSync(path.join(TPL, NANOCLAW_EXTENSION_NS, 'tasks'), { recursive: true });
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(change(result.changes, 'task', 'weekday-briefing').action).toBe('remove');
-    expect(allTaskSeries(g.id)).toEqual([]);
+    expect(await allTaskSeries(g.id)).toEqual([]);
   });
 
-  it('updates the stamped series, not a newer user task with the same name', () => {
-    const g = stamp();
-    const stamped = liveTasks(g.id)[0].series_id;
+  it('updates the stamped series, not a newer user task with the same name', async () => {
+    const g = await stamp();
+    const stamped = (await liveTasks(g.id))[0].series_id;
     const prepared = prepareScheduledTask({
       name: 'weekday-briefing',
       prompt: 'My own briefing.',
       recurrence: '0 12 * * 1-5',
       timezone: 'UTC',
     });
-    const mine = createScheduledTask(g.id, prepared, { status: 'pending' }).row.series_id!;
+    const mine = (await createScheduledTask(g.id, prepared, { status: 'pending' })).row.seriesId!;
     writeTemplateV2();
 
-    restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
-    const tasks = liveTasks(g.id);
+    const tasks = await liveTasks(g.id);
     expect(tasks.find((t) => t.series_id === mine)!.prompt).toBe('My own briefing.');
     expect(tasks.find((t) => t.series_id === stamped)!.prompt).toBe('Send the improved weekday briefing.');
   });
 
-  it('treats a rename that preserves the slug as an update, never remove+create', () => {
-    const g = stamp();
-    const series = liveTasks(g.id)[0].series_id;
+  it('treats a rename that preserves the slug as an update, never remove+create', async () => {
+    const g = await stamp();
+    const series = (await liveTasks(g.id))[0].series_id;
     writeTemplateV2();
     fs.rmSync(path.join(TPL, NANOCLAW_EXTENSION_NS, 'tasks'), { recursive: true });
     // Same slug as v1's weekday-briefing, different name casing.
     writeTask('Weekday-Briefing', '0 8 * * 1-5', 'Renamed but same series.');
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(result.changes.filter((c) => c.surface === 'task' && c.action === 'remove')).toEqual([]);
-    const tasks = liveTasks(g.id);
+    const tasks = await liveTasks(g.id);
     expect(tasks).toHaveLength(1);
     expect(tasks[0].series_id).toBe(series);
     expect(tasks[0].prompt).toBe('Renamed but same series.');
   });
 
-  it('rejects a template whose task names collide on the truncated id slug', () => {
-    const g = stamp();
+  it('rejects a template whose task names collide on the truncated id slug', async () => {
+    const g = await stamp();
     writeTask('a'.repeat(30), '0 9 * * *', 'One.');
     writeTask('a'.repeat(31), '0 9 * * *', 'Two.');
 
-    expect(() => restampAgentFromTemplate('sales/sdr', g.id, { apply: false })).toThrow(/collide on id slug/);
+    await expect(restampAgentFromTemplate('sales/sdr', g.id, { apply: false })).rejects.toThrow(/collide on id slug/);
   });
 
-  it('removes a skill and deletes a task series the new template dropped', () => {
-    const g = stamp();
+  it('removes a skill and deletes a task series the new template dropped', async () => {
+    const g = await stamp();
     writeTemplateV2();
     // v3 = v2 without the widget skill and without any tasks.
     fs.rmSync(path.join(TPL, 'skills', 'widget'), { recursive: true });
     fs.rmSync(path.join(TPL, NANOCLAW_EXTENSION_NS, 'tasks'), { recursive: true });
 
-    const result = restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
+    const result = await restampAgentFromTemplate('sales/sdr', g.id, { apply: true });
 
     expect(change(result.changes, 'skill', 'widget').action).toBe('remove');
     expect(change(result.changes, 'task', 'weekday-briefing').action).toBe('remove');
     expect(fs.existsSync(overlaySkill(g.id, 'widget'))).toBe(false);
-    expect(liveTasks(g.id)).toHaveLength(0);
+    expect(await liveTasks(g.id)).toHaveLength(0);
   });
 });

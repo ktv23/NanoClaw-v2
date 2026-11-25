@@ -34,31 +34,27 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-programmatic-wiring' };
 });
 
-// groups-create calls initGroupFilesystem, which scaffolds under the real
-// groups/ dir — neutralize the FS writes but keep the container_configs row
-// the assertions below count.
-vi.mock('../../group-init.js', async () => {
-  const { ensureContainerConfig } = await import('../../db/container-configs.js');
-  return {
-    initGroupFilesystem: vi.fn((group: { id: string }) => {
-      ensureContainerConfig(group.id);
-    }),
-  };
-});
-
 // wirings' postCommit projects destinations into live session DBs — no
 // sessions run in this test, but the module must not open on-disk DB files.
 vi.mock('../../modules/agent-to-agent/write-destinations.js', () => ({ writeDestinations: vi.fn() }));
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-programmatic-wiring';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getDb,
+} from '../../db/index.js';
+import { getDestinations } from '../../modules/agent-to-agent/db/agent-destinations.js';
 import { dispatch } from '../dispatch.js';
 // Side-effect imports: register the verbs under test.
 import './messaging-groups.js';
 import './wirings.js';
 import './users.js';
-import './groups.js';
 
 const HOST = { caller: 'host' as const };
 function now(): string {
@@ -67,23 +63,19 @@ function now(): string {
 function send(command: string, args: Record<string, unknown>) {
   return dispatch({ id: 'test', command, args }, HOST);
 }
-function count(sql: string, ...params: unknown[]): number {
-  return (
-    getDb()
-      .prepare(sql)
-      .get(...params) as { c: number }
-  ).c;
+async function count(sql: string, ...params: unknown[]): Promise<number> {
+  return (await getDb().get<{ c: number }>(sql, ...params))!.c;
 }
 
 describe('programmatic wiring verbs', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
     fs.mkdirSync(TEST_DIR, { recursive: true });
-    runMigrations(initTestDb());
-    createAgentGroup({ id: 'ag-1', name: 'Nano', folder: 'nano', agent_provider: null, created_at: now() });
+    await runMigrations(await initTestDb());
+    await createAgentGroup({ id: 'ag-1', name: 'Nano', folder: 'nano', agent_provider: null, created_at: now() });
   });
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
@@ -105,14 +97,33 @@ describe('programmatic wiring verbs', () => {
     });
     expect(r2.ok).toBe(true);
     expect((r2 as { data: { id: string } }).data.id).toBe((mg1 as { id: string }).id); // same row
-    expect(count(`SELECT COUNT(*) c FROM messaging_groups WHERE platform_id = ?`, 'resend:you@example.com')).toBe(1);
+    expect(await count(`SELECT COUNT(*) c FROM messaging_groups WHERE platform_id = ?`, 'resend:you@example.com')).toBe(
+      1,
+    );
+  });
+
+  it('returns the winner when natural-key creates race', async () => {
+    const args = {
+      channel_type: 'resend',
+      platform_id: 'resend:race@example.com',
+      is_group: 0,
+    };
+    const [first, second] = await Promise.all([
+      send('messaging-groups-create', args),
+      send('messaging-groups-create', args),
+    ]);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect((first as { data: { id: string } }).data.id).toBe((second as { data: { id: string } }).data.id);
+    expect(await count(`SELECT COUNT(*) c FROM messaging_groups WHERE platform_id = ?`, args.platform_id)).toBe(1);
   });
 
   it('users create is idempotent on the user id', async () => {
     const args = { id: 'resend:you@example.com', kind: 'resend', display_name: 'Owner' };
     expect((await send('users-create', args)).ok).toBe(true);
     expect((await send('users-create', args)).ok).toBe(true); // no UNIQUE violation
-    expect(count(`SELECT COUNT(*) c FROM users WHERE id = ?`, 'resend:you@example.com')).toBe(1);
+    expect(await count(`SELECT COUNT(*) c FROM users WHERE id = ?`, 'resend:you@example.com')).toBe(1);
   });
 
   it('wirings create resolves natural keys (platform_id + agent-group folder) and is idempotent', async () => {
@@ -140,7 +151,44 @@ describe('programmatic wiring verbs', () => {
     const w2 = await send('wirings-create', wireArgs);
     expect(w2.ok).toBe(true);
     expect((w2 as { data: { id: string } }).data.id).toBe((wiring as { id: string }).id); // idempotent on the pair
-    expect(count(`SELECT COUNT(*) c FROM messaging_group_agents WHERE agent_group_id = ?`, 'ag-1')).toBe(1);
+    expect(await count(`SELECT COUNT(*) c FROM messaging_group_agents WHERE agent_group_id = ?`, 'ag-1')).toBe(1);
+  });
+
+  it('retries destination-name conflicts from concurrent wiring creates', async () => {
+    for (const [id, platformId] of [
+      ['mg-race-1', 'resend:first@example.com'],
+      ['mg-race-2', 'resend:second@example.com'],
+    ]) {
+      await createMessagingGroup({
+        id,
+        channel_type: 'resend',
+        platform_id: platformId,
+        name: 'Shared Name',
+        is_group: 0,
+        unknown_sender_policy: 'public',
+        created_at: now(),
+      });
+    }
+    const wiring = (id: string, messagingGroupId: string) => ({
+      id,
+      messaging_group_id: messagingGroupId,
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern' as const,
+      engage_pattern: '.',
+      sender_scope: 'all' as const,
+      ignored_message_policy: 'drop' as const,
+      session_mode: 'shared' as const,
+      priority: 0,
+      created_at: now(),
+    });
+
+    await Promise.all([
+      createMessagingGroupAgent(wiring('mga-race-1', 'mg-race-1')),
+      createMessagingGroupAgent(wiring('mga-race-2', 'mg-race-2')),
+    ]);
+
+    const destinations = await getDestinations('ag-1');
+    expect(destinations.map((row) => row.local_name).sort()).toEqual(['shared-name', 'shared-name-2']);
   });
 
   it('wirings create fails clearly when the messaging group has not been created yet', async () => {
@@ -151,19 +199,6 @@ describe('programmatic wiring verbs', () => {
     });
     expect(r.ok).toBe(false);
     expect((r as { error: { message: string } }).error.message).toMatch(/no messaging group/i);
-  });
-
-  it('groups create scaffolds the container config and is idempotent on folder', async () => {
-    const r1 = await send('groups-create', { folder: 'dm-with-bob', name: 'Bob' });
-    expect(r1.ok).toBe(true);
-    const ag = (r1 as { data: { id: string } }).data;
-    expect(ag.id).toBeTruthy();
-    // a working group needs a container_config row — generic create never made one
-    expect(count('SELECT COUNT(*) c FROM container_configs WHERE agent_group_id = ?', ag.id)).toBe(1);
-    // idempotent on folder
-    const r2 = await send('groups-create', { folder: 'dm-with-bob', name: 'Bob' });
-    expect((r2 as { data: { id: string } }).data.id).toBe(ag.id);
-    expect(count('SELECT COUNT(*) c FROM agent_groups WHERE folder = ?', 'dm-with-bob')).toBe(1);
   });
 
   it('messaging-groups send errors when no group exists (lookup before routeInbound)', async () => {

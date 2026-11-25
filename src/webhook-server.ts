@@ -9,26 +9,16 @@
  * to its owning Chat instance. Raw routes let modules receive non-Chat-SDK
  * webhooks (GitHub, payment providers, health checks) on the same server
  * without editing this file or opening a second port.
+ *
+ * Listens on WEBHOOK_HOST (default 127.0.0.1) and WEBHOOK_PORT (default 3000).
  */
 import http from 'http';
+import { randomUUID } from 'node:crypto';
 
 import type { Chat } from 'chat';
 
+import { getWebhookHost, getWebhookPort } from './config.js';
 import { log } from './log.js';
-
-const DEFAULT_PORT = 3000;
-
-// Chat-SDK webhook payloads are small (a few KB). Cap the buffered body so an
-// unauthenticated client can't exhaust host memory by POSTing an arbitrarily
-// large body to /webhook/<adapter> before signature verification runs.
-const MAX_WEBHOOK_BODY_BYTES = 1_048_576; // 1 MiB
-
-class WebhookBodyTooLargeError extends Error {
-  constructor() {
-    super('Webhook body exceeds size limit');
-    this.name = 'WebhookBodyTooLargeError';
-  }
-}
 
 interface WebhookEntry {
   chat: Chat;
@@ -41,24 +31,24 @@ export type RawWebhookHandler = (req: http.IncomingMessage, res: http.ServerResp
 const routes = new Map<string, WebhookEntry>();
 const rawRoutes = new Map<string, RawWebhookHandler>();
 let server: http.Server | null = null;
+let listenerId: string | null = null;
+
+/** Report only a successfully bound listener owned by this host process. */
+export function getWebhookStatus(): { id: string; host: string; port: number; paths: string[] } | null {
+  const address = server?.address();
+  if (!server?.listening || !address || typeof address === 'string' || !listenerId) return null;
+  return {
+    id: listenerId,
+    host: address.address,
+    port: address.port,
+    paths: [...new Set([...routes.keys(), ...rawRoutes.keys()])].map((p) => `/webhook/${p}`),
+  };
+}
 
 /** Convert Node.js IncomingMessage to a Web API Request. */
 async function toWebRequest(req: http.IncomingMessage): Promise<Request> {
-  // Reject on a declared oversize body before reading a single byte.
-  const declaredLen = Number(req.headers['content-length']);
-  if (Number.isFinite(declaredLen) && declaredLen > MAX_WEBHOOK_BODY_BYTES) {
-    throw new WebhookBodyTooLargeError();
-  }
   const chunks: Buffer[] = [];
-  let total = 0;
   for await (const chunk of req) {
-    total += (chunk as Buffer).length;
-    // Enforce the ceiling while streaming too — a chunked request can omit or
-    // lie about Content-Length.
-    if (total > MAX_WEBHOOK_BODY_BYTES) {
-      req.destroy();
-      throw new WebhookBodyTooLargeError();
-    }
     chunks.push(chunk as Buffer);
   }
   const body = Buffer.concat(chunks);
@@ -135,69 +125,72 @@ export function registerWebhookHandler(path: string, handler: RawWebhookHandler)
 function ensureServer(): void {
   if (server) return;
 
-  const port = parseInt(process.env.WEBHOOK_PORT || String(DEFAULT_PORT), 10);
+  const host = getWebhookHost();
+  const port = getWebhookPort();
+  const id = randomUUID();
 
-  server = http.createServer(async (req, res) => {
-    const url = req.url || '/';
+  const candidate = http.createServer((req, res) => {
+    res.setHeader('x-nanoclaw-webhook-id', id);
+    void (async () => {
+      const url = req.url || '/';
 
-    // Route: /webhook/{adapterName}
-    const match = url.match(/^\/webhook\/([^/?]+)/);
-    if (!match) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found');
-      return;
-    }
-
-    const adapterName = match[1];
-
-    try {
-      // Raw routes take priority — the handler writes the response itself.
-      const rawHandler = rawRoutes.get(adapterName);
-      if (rawHandler) {
-        await rawHandler(req, res);
-        return;
-      }
-
-      const entry = routes.get(adapterName);
-      if (!entry) {
+      // Route: /webhook/{adapterName}
+      const match = url.match(/^\/webhook\/([^/?]+)/);
+      if (!match) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end(`Unknown adapter: ${adapterName}`);
+        res.end('Not found');
         return;
       }
 
-      const webReq = await toWebRequest(req);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const webhooks = entry.chat.webhooks as Record<string, (r: Request, opts?: any) => Promise<Response>>;
-      const handler = webhooks[entry.adapterName];
-      const webRes = await handler(webReq, {
-        waitUntil: (p: Promise<unknown>) => {
-          p.catch(() => {});
-        },
-      });
-      await fromWebResponse(webRes, res);
-    } catch (err) {
-      if (err instanceof WebhookBodyTooLargeError) {
-        if (!res.headersSent) {
-          res.writeHead(413, { 'Content-Type': 'text/plain' });
-          res.end('Payload Too Large');
+      const adapterName = match[1];
+
+      try {
+        // Raw routes take priority — the handler writes the response itself.
+        const rawHandler = rawRoutes.get(adapterName);
+        if (rawHandler) {
+          await rawHandler(req, res);
+          return;
         }
-        return;
+
+        const entry = routes.get(adapterName);
+        if (!entry) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not found');
+          return;
+        }
+
+        const webReq = await toWebRequest(req);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const webhooks = entry.chat.webhooks as Record<string, (r: Request, opts?: any) => Promise<Response>>;
+        const handler = webhooks[entry.adapterName];
+        const webRes = await handler(webReq, {
+          waitUntil: (p: Promise<unknown>) => {
+            void p.catch(() => {});
+          },
+        });
+        await fromWebResponse(webRes, res);
+      } catch (err) {
+        log.error('Webhook handler error', { adapter: adapterName, url: req.url, err });
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end('Internal Server Error');
+        }
       }
-      log.error('Webhook handler error', { adapter: adapterName, url: req.url, err });
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Internal Server Error');
-      }
-    }
+    })();
   });
 
-  // Bind host is configurable: keep 0.0.0.0 as the default (external webhooks
-  // like GitHub / WhatsApp Cloud need reachability), but let an operator whose
-  // webhooks arrive via a local tunnel/reverse-proxy set WEBHOOK_HOST=127.0.0.1
-  // to take the endpoint off the LAN entirely.
-  const host = process.env.WEBHOOK_HOST || '0.0.0.0';
-  server.listen(port, host, () => {
-    log.info('Webhook server started', { port, host, adapters: [...routes.keys()] });
+  // Keep the candidate as the singleton while listen is pending so concurrent
+  // registrations cannot create competing listeners. A failed listen must
+  // release that singleton, though, or later registrations can never retry.
+  server = candidate;
+  listenerId = id;
+  candidate.on('error', (err) => {
+    if (!candidate.listening && server === candidate) server = null;
+    log.error('Webhook server error', { host, port, err });
+  });
+
+  candidate.listen(port, host, () => {
+    log.info('Webhook server started', { host, port, adapters: [...routes.keys()] });
   });
 }
 

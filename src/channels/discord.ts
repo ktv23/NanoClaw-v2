@@ -2,11 +2,13 @@
  * Discord channel adapter (v2) — uses Chat SDK bridge.
  * Self-registers on import.
  */
-import { createDiscordAdapter } from '@chat-adapter/discord';
+import { cardToDiscordPayload, createDiscordAdapter } from '@chat-adapter/discord';
+import { parseMarkdown, walkAst } from 'chat';
+
+import * as askQuestion from './ask-question.js';
 
 import { readEnvFile } from '../env.js';
-import { log } from '../log.js';
-import type { ChannelAdapter, ChannelDefaults } from './adapter.js';
+import type { ChannelDefaults } from './adapter.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -22,6 +24,58 @@ const DISCORD_DEFAULTS: ChannelDefaults = {
   mentions: 'platform',
 };
 
+// A card's own *Label:* at a line start, which Discord closes on that line,
+// stays. Otherwise a mark, with any backslashes before it to count.
+const LABEL_OR_MARK = /(?<=^|\n)\*(?![\s*])(?:\\[^\n]|[^\\*`\n])*?:\*(?!\*)|(\\*)([`[*_~])/g;
+
+/**
+ * Discord renders card text as Markdown: `[text](url)` shows any text for a
+ * link, `<@id>` shows another user's name and `||text||` hides text. A word
+ * joiner breaks each outside code (including every pipe in a spoiler run), and
+ * a clicker's name or a request value can't pose as other text.
+ */
+export function escapeDiscordCardText(card: string): string {
+  // Discord reads \r and \r\n as a line break and drops form feeds before it
+  // parses, so check and send the text as Discord will read it.
+  const text = card.replace(/\r\n?/g, '\n').replace(/\f/g, '');
+  // Code is already literal on Discord. Keep commands inside matched code
+  // spans/fences byte-for-byte, and escape only the surrounding prose. Its
+  // backticks, [ and * _ ~ get a backslash: Discord pairs them, or ends a link,
+  // past code and across the blocks of one embed, which are escaped one by one.
+  const escape = (prose: string) =>
+    prose
+      .replace(/\]\(/g, ']\u2060(')
+      .replace(/</g, '<\u2060')
+      .replace(/\|{2,}/g, (pipes) => pipes.split('').join('\u2060') + '\u2060')
+      .replace(LABEL_OR_MARK, (match: string, slashes?: string, mark?: string) =>
+        mark === undefined || slashes!.length % 2 ? match : `${slashes}\\${mark}`,
+      );
+  let result = '';
+  let offset = 0;
+  let code: Array<{ start: number; end: number }> = [];
+  // Discord ends ``` code at the next ```, even mid-line, inside a longer
+  // fence or past a blank fence's close, shows indented, tilde and unclosed
+  // fences as prose, and ends a quote at the line. So only a one-line span
+  // with no backtick, or a ``` fence holding a non-blank line and no ```, stays raw.
+  const plain = /^(?:(`{1,2})[^`\n]+\1|```[^`\n]*\n\n*(?:[^`\n]|`(?!``))(?:[^`]|`(?!``))*\n```[ \t]*)$/;
+  walkAst(parseMarkdown(text), (node) => {
+    if (node.type === 'code' || node.type === 'inlineCode') {
+      const start = node.position?.start.offset;
+      const end = node.position?.end.offset;
+      if (start !== undefined && end !== undefined && plain.test(text.slice(start, end))) code.push({ start, end });
+    }
+    return node;
+  });
+  // Any other unescaped backtick can shift Discord's pairing: keep nothing raw.
+  const outside = [...code.map((c, i) => text.slice(i ? code[i - 1].end : 0, c.start)), text.slice(code.at(-1)?.end)];
+  if (outside.some((part) => /(?:^|[^\\])(?:\\\\)*`/.test(part))) code = [];
+  for (const { start, end } of code) {
+    result += escape(text.slice(offset, start)) + text.slice(start, end);
+    offset = end;
+  }
+  return result + escape(text.slice(offset));
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
   if (!raw.referenced_message) return null;
@@ -35,9 +89,8 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
 /**
  * Discord message forwards carry their content in `message_snapshots`, not
  * `content` (`message_reference.type === 1` means FORWARD; 0 is a normal
- * reply). The adapter only reads `content`/`attachments`, so without this the
- * agent sees an empty message. Unwrap the snapshot back into the payload so
- * text, attachment download, and formatting all ride the existing path.
+ * reply). Unwrap the snapshot into the payload, then drop `message_snapshots`
+ * so adapters >= 4.38 (which flatten snapshots themselves) don't add it twice.
  * Note: snapshots contain no author, so the original sender is unavailable.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -60,9 +113,10 @@ export function unwrapForwardedSnapshot(data: Record<string, any>): void {
   if (fwdAttachments.length > 0) {
     data.attachments = [...(data.attachments ?? []), ...fwdAttachments];
   }
+  delete data.message_snapshots;
 }
 
-function unwrapForwards(adapter: ReturnType<typeof createDiscordAdapter>): void {
+export function unwrapForwards(adapter: ReturnType<typeof createDiscordAdapter>): void {
   const a = adapter as unknown as {
     handleForwardedMessage: (data: Record<string, unknown>, options?: unknown) => Promise<void>;
   };
@@ -70,6 +124,31 @@ function unwrapForwards(adapter: ReturnType<typeof createDiscordAdapter>): void 
   a.handleForwardedMessage = async (data, options) => {
     unwrapForwardedSnapshot(data);
     return orig(data, options);
+  };
+}
+
+/**
+ * Discord keeps a message's buttons on an edit that sends no components, and
+ * the adapter sends none for a card without actions. So an edit of a message
+ * into such a card, like a resolved approval, also sends `components: []`.
+ * A card closed with no click (timed out, expired) has no other way to lose them.
+ */
+export function clearButtonsOnCardEdits(adapter: ReturnType<typeof createDiscordAdapter>): void {
+  const a = adapter as unknown as {
+    discordFetch?: (path: string, method: string, body?: unknown) => Promise<Response>;
+  };
+  // An adapter version without this internal keeps its own behaviour.
+  if (typeof a.discordFetch !== 'function') return;
+  const discordFetch = a.discordFetch.bind(adapter);
+  a.discordFetch = (path, method, body) => {
+    const cardEdit =
+      method === 'PATCH' &&
+      /^\/channels\/[^/]+\/messages\/[^/]+$/.test(path) &&
+      typeof body === 'object' &&
+      body !== null &&
+      'embeds' in body &&
+      !('components' in body);
+    return discordFetch(path, method, cardEdit ? { ...body, components: [] } : body);
   };
 }
 
@@ -82,51 +161,36 @@ registerChannelAdapter('discord', {
       publicKey: env.DISCORD_PUBLIC_KEY,
       applicationId: env.DISCORD_APPLICATION_ID,
     });
+    const edit = discordAdapter.editMessage.bind(discordAdapter);
+    discordAdapter.editMessage = async (...args) => {
+      const message = args[2];
+      const { CardTooLongError } = askQuestion as { CardTooLongError?: new (reason: string) => Error };
+      if (CardTooLongError && typeof message === 'object' && 'card' in message) {
+        const payload = cardToDiscordPayload(message.card);
+        if (payload.embeds.some((embed) => (embed.description?.length ?? 0) > 4096)) {
+          throw new CardTooLongError('the resolved card exceeds the Discord embed description limit');
+        }
+      }
+      return edit(...args);
+    };
     unwrapForwards(discordAdapter);
-    const token = env.DISCORD_BOT_TOKEN;
-    const bridge = createChatSdkBridge({
+    clearButtonsOnCardEdits(discordAdapter);
+    return createChatSdkBridge({
       adapter: discordAdapter,
       concurrency: 'concurrent',
-      botToken: token,
+      botToken: env.DISCORD_BOT_TOKEN,
       extractReplyContext,
       supportsThreads: true,
       defaults: DISCORD_DEFAULTS,
       // Discord rejects messages over 2000 chars; without this the bridge
       // would let long agent replies fail instead of splitting them.
       maxTextLength: 2000,
+      // A card is one embed, whose description Discord caps at 4,096. The
+      // limit counts the title and escaped text, and the embed adds only a
+      // blank line between blocks, so a longer card is refused, never cut.
+      // Spread, so an older core without these options still type-checks (and ignores them).
+      ...{ escapeCardText: escapeDiscordCardText, maxCardTextLength: 4000 },
     });
-
-    // Give bot-spawned threads a meaningful name. When the agent is @mentioned
-    // in a group channel (threads:on), Discord opens a thread auto-named
-    // "Thread <timestamp>". The router fires this once, on the new per-thread
-    // session, with a title derived from the triggering message. We rename ONLY
-    // that auto-generated name — never a thread a human titled deliberately.
-    const wrapped: ChannelAdapter = {
-      ...bridge,
-      setThreadTitle: async (_platformId: string, threadId: string, title: string): Promise<void> => {
-        const snowflake = threadId.split(':').pop();
-        const name = title.trim().slice(0, 90);
-        if (!snowflake || !name) return;
-        try {
-          const res = await fetch(`https://discord.com/api/v10/channels/${snowflake}`, {
-            headers: { Authorization: `Bot ${token}` },
-          });
-          if (!res.ok) return;
-          const chan = (await res.json()) as { name?: string };
-          // Only auto-generated thread names ("Thread 8/18/2026, 8:28 AM") get
-          // renamed; a user-named thread (e.g. "Helldivers play KDM") is left alone.
-          if (!chan.name || !/^Thread\b/i.test(chan.name)) return;
-          await fetch(`https://discord.com/api/v10/channels/${snowflake}`, {
-            method: 'PATCH',
-            headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name }),
-          });
-        } catch (err) {
-          log.warn('discord setThreadTitle failed', { threadId, err });
-        }
-      },
-    };
-    return wrapped;
   },
   defaults: DISCORD_DEFAULTS,
 });

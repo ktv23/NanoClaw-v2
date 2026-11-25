@@ -10,8 +10,8 @@
  * Kept in its own leaf file so both response-handler.ts and reason-capture.ts
  * can import it without an import cycle (finalize → primitive only).
  */
-import { wakeContainer } from '../../container-runner.js';
-import { deletePendingApproval } from '../../db/sessions.js';
+import { requestWake } from '../../request-wake.js';
+import { deletePendingApproval, transitionPendingApprovalStatus } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
@@ -24,19 +24,26 @@ import { notifyApprovalResolved } from './primitive.js';
  * When `reason` is provided it's appended to the agent-facing note with generic
  * attribution — the why, not the who (the rejecting admin may belong to a
  * different owner than the requesting agent). Callers are responsible for
- * clamping the reason length before passing it in.
+ * clamping the reason length before passing it in. `from` is the status the
+ * row must still hold (default: its status as read); `accepted` is told once the
+ * reject is recorded, before the agent is notified and woken.
  */
 export async function finalizeReject(
   approval: PendingApproval,
   session: Session,
   userId: string,
-  reason?: string,
-): Promise<void> {
+  options: { reason?: string; from?: 'pending' | 'awaiting_reason'; accepted?: () => void } = {},
+): Promise<boolean> {
+  const { reason, accepted } = options;
+  const from = options.from ?? (approval.status === 'awaiting_reason' ? 'awaiting_reason' : 'pending');
+  if (!(await transitionPendingApprovalStatus(approval.approval_id, from, 'rejected'))) return false;
+  accepted?.();
+
   const text = reason
     ? `Your ${approval.action} request was rejected by admin: "${reason}"`
     : `Your ${approval.action} request was rejected by admin.`;
 
-  writeSessionMessage(session.agent_group_id, session.id, {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -53,7 +60,8 @@ export async function finalizeReject(
     withReason: reason !== undefined,
   });
 
-  deletePendingApproval(approval.approval_id);
+  await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
-  await wakeContainer(session);
+  await requestWake(session, 'approval-response');
+  return true;
 }

@@ -35,7 +35,7 @@ export function parseSkillsArg(raw: string): Skills {
 
 /**
  * Ensure `skill` is mounted. If the group already mounts `'all'`, the skill is
- * already included — a no-op success (this is what `forge deploy` relies on).
+ * already included — a no-op success, so a deploy script can call it unconditionally.
  */
 export function addSkill(cur: Skills, skill: string): { skills: Skills; added: boolean; note: string } {
   if (cur === 'all') {
@@ -47,7 +47,7 @@ export function addSkill(cur: Skills, skill: string): { skills: Skills; added: b
   return {
     skills: [...cur, skill],
     added: true,
-    note: 'Run `ncl groups restart --rebuild` to remount.',
+    note: 'Run `ncl groups restart` to remount.',
   };
 }
 

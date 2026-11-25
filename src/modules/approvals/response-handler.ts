@@ -9,84 +9,80 @@
  *      "Reject with reason…" we hold the row and capture the admin's next DM as
  *      a one-line reason (see reason-capture.ts). Reject finalization is shared
  *      via finalizeReject.
- *   2. OneCLI credential approvals (`action = 'onecli_credential'`). Resolved
- *      via an in-memory Promise — see onecli-approvals.ts.
  *
  * The response handler is registered via core's `registerResponseHandler`;
- * core iterates handlers and the first one to return `true` claims the response.
+ * core offers a click to each handler in turn, and the first to return an
+ * outcome owns it.
  */
-import { wakeContainer } from '../../container-runner.js';
-import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
-import type { ResponsePayload } from '../../response-registry.js';
+import { requestWake } from '../../request-wake.js';
+import {
+  deletePendingApproval,
+  getPendingApproval,
+  getSession,
+  transitionPendingApprovalStatus,
+} from '../../db/sessions.js';
+import type { ResponseOutcome, ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
-import { GROUP_SCOPE_RESOURCES } from '../../cli/registry.js';
 import { finalizeReject } from './finalize.js';
-import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
 import { armReasonCapture } from './reason-capture.js';
 
-export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
-  const approval = getPendingApproval(payload.questionId);
+export async function handleApprovalsResponse(payload: ResponsePayload): Promise<ResponseOutcome | false> {
+  const approval = await getPendingApproval(payload.questionId);
   if (!approval) return false;
 
-  if (!isAuthorizedApprovalClick(approval, payload)) {
+  if (!(await isAuthorizedApprovalClick(approval, payload))) {
     log.warn('Ignoring unauthorized approval response', {
       approvalId: approval.approval_id,
       action: approval.action,
       userId: payload.userId,
       channelType: payload.channelType,
     });
-    return true;
+    return 'refused';
   }
 
-  if (approval.action === ONECLI_ACTION) {
-    if (resolveOneCLIApproval(payload.questionId, payload.value)) {
-      return true;
-    }
-    // Row exists but the in-memory resolver is gone (timer fired or the process
-    // was in a weird state). Nothing to do — just drop the row.
-    deletePendingApproval(payload.questionId);
-    return true;
-  }
-
-  await handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '');
-  return true;
+  return handleRegisteredApproval(approval, payload.value, namespacedUserId(payload) ?? '', payload.accepted);
 }
 
 async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
   userId: string,
-): Promise<void> {
+  accepted?: () => void,
+): Promise<ResponseOutcome> {
+  // The session that asked is gone: so is the request.
   if (!approval.session_id) {
-    deletePendingApproval(approval.approval_id);
-    return;
+    await deletePendingApproval(approval.approval_id);
+    return 'closed';
   }
-  const session = getSession(approval.session_id);
+  const session = await getSession(approval.session_id);
   if (!session) {
-    deletePendingApproval(approval.approval_id);
-    return;
+    await deletePendingApproval(approval.approval_id);
+    return 'closed';
   }
 
   // "Reject with reason…" — hold the row and capture the admin's next DM
   // instead of finalizing now. The agent is notified exactly once: after the
   // reason arrives, or after the sweep's timeout if the admin ghosts.
   if (selectedOption === REJECT_WITH_REASON_VALUE) {
-    await armReasonCapture(approval, session, userId);
-    return;
+    return (await armReasonCapture(approval, session, userId, accepted)) ? 'accepted' : 'ignored';
   }
 
-  // Plain Reject (or any other non-approve value) — instant fast path.
+  // Plain Reject (or any other non-approve value) — instant fast path. Only from
+  // 'pending': a card click must not cut short a reason the admin is typing.
   if (selectedOption !== 'approve') {
-    await finalizeReject(approval, session, userId);
-    return;
+    return (await finalizeReject(approval, session, userId, { from: 'pending', accepted })) ? 'accepted' : 'ignored';
   }
+
+  if (!(await transitionPendingApprovalStatus(approval.approval_id, 'pending', 'approved'))) return 'ignored';
+  // The decision is recorded: the card can show it while the action runs.
+  accepted?.();
 
   // Approved — dispatch to the module that registered for this action.
-  const notify = (text: string): void => {
+  const notify = (text: string): Promise<void> =>
     writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
@@ -96,7 +92,6 @@ async function handleRegisteredApproval(
       threadId: null,
       content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
     });
-  };
 
   const handler = getApprovalHandler(approval.action);
   if (!handler) {
@@ -104,11 +99,11 @@ async function handleRegisteredApproval(
       approvalId: approval.approval_id,
       action: approval.action,
     });
-    notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
-    deletePendingApproval(approval.approval_id);
+    await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
+    await deletePendingApproval(approval.approval_id);
     await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
-    await wakeContainer(session);
-    return;
+    await requestWake(session, 'approval-response');
+    return 'accepted';
   }
 
   const payload = JSON.parse(approval.payload);
@@ -117,22 +112,23 @@ async function handleRegisteredApproval(
     log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
   } catch (err) {
     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
-    notify(
+    await notify(
       `Your ${approval.action} was approved, but applying it failed: ${err instanceof Error ? err.message : String(err)}.`,
     );
   }
 
-  deletePendingApproval(approval.approval_id);
+  await deletePendingApproval(approval.approval_id);
   await notifyApprovalResolved({ approval, session, outcome: 'approve', userId });
-  await wakeContainer(session);
+  await requestWake(session, 'approval-response');
+  return 'accepted';
 }
 
-function namespacedUserId(payload: ResponsePayload): string | null {
+export function namespacedUserId(payload: ResponsePayload): string | null {
   if (!payload.userId) return null;
   return payload.userId.includes(':') ? payload.userId : `${payload.channelType}:${payload.userId}`;
 }
 
-function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): boolean {
+export async function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): Promise<boolean> {
   const userId = namespacedUserId(payload);
   if (!userId) return false;
 
@@ -141,41 +137,12 @@ function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponseP
     return userId === approval.approver_user_id;
   }
 
-  // A `cli_command` from a cli_scope=global agent can carry a GLOBAL-effect
-  // command (e.g. `roles grant --role owner`, `policies set`) whose blast radius
-  // is not confined to the requesting group. A merely-scoped admin of that group
-  // must not be able to approve it — otherwise administering a global-scope agent
-  // group silently confers global authority (a scoped admin could have the agent
-  // request `roles grant` for themselves and then approve it). Require a global
-  // admin/owner unless the command's resource is group-scoped.
-  if (approval.action === 'cli_command' && !isGroupScopedCliCommand(approval)) {
-    return isOwner(userId) || isGlobalAdmin(userId);
-  }
-
   const agentGroupId =
-    approval.agent_group_id ?? (approval.session_id ? getSession(approval.session_id)?.agent_group_id : null);
+    approval.agent_group_id ?? (approval.session_id ? (await getSession(approval.session_id))?.agent_group_id : null);
 
   if (!agentGroupId) {
-    return isOwner(userId) || isGlobalAdmin(userId);
+    return (await isOwner(userId)) || (await isGlobalAdmin(userId));
   }
 
   return hasAdminPrivilege(userId, agentGroupId);
-}
-
-/**
- * True when a held `cli_command` targets a group-scoped resource (its effect is
- * confined to the agent group), so a scoped admin of that group may approve it.
- * Fails closed: an unparseable payload or unknown resource is treated as
- * global-effect and requires a global approver.
- */
-function isGroupScopedCliCommand(approval: PendingApproval): boolean {
-  try {
-    const payload = JSON.parse(approval.payload) as { frame?: { command?: string } };
-    const command = payload.frame?.command;
-    if (!command) return false;
-    const resource = command.trim().split(/\s+/)[0];
-    return GROUP_SCOPE_RESOURCES.has(resource);
-  } catch {
-    return false;
-  }
 }

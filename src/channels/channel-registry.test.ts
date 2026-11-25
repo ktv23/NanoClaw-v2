@@ -235,8 +235,11 @@ describe('channel registry — instance keying', () => {
       JSON.stringify({ text: 'to the tester bot' }),
       undefined,
       'slack-tester',
+      'out-1',
     );
     expect(tester.delivered).toHaveLength(1);
+    // The row id reaches the adapter, so a split reply can resume on retry.
+    expect(tester.delivered[0].deliveryId).toBe('out-1');
   });
 });
 
@@ -247,17 +250,17 @@ describe('channel + router integration', () => {
 
     const { initTestDb, runMigrations, createAgentGroup, createMessagingGroup, createMessagingGroupAgent } =
       await import('../db/index.js');
-    const db = initTestDb();
-    runMigrations(db);
+    const db = await initTestDb();
+    await runMigrations(db);
 
-    createAgentGroup({
+    await createAgentGroup({
       id: 'ag-1',
       name: 'Test Agent',
       folder: 'test-agent',
       agent_provider: null,
       created_at: now(),
     });
-    createMessagingGroup({
+    await createMessagingGroup({
       id: 'mg-1',
       channel_type: 'mock',
       platform_id: 'chan-100',
@@ -266,7 +269,7 @@ describe('channel + router integration', () => {
       unknown_sender_policy: 'public',
       created_at: now(),
     });
-    createMessagingGroupAgent({
+    await createMessagingGroupAgent({
       id: 'mga-1',
       messaging_group_id: 'mg-1',
       agent_group_id: 'ag-1',
@@ -282,14 +285,14 @@ describe('channel + router integration', () => {
 
   afterEach(async () => {
     const { closeDb } = await import('../db/index.js');
-    closeDb();
+    await closeDb();
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
   it('should route inbound message from adapter to session DB', async () => {
     const { routeInbound } = await import('../router.js');
     const { findSession } = await import('../db/sessions.js');
-    const { inboundDbPath } = await import('../session-manager.js');
+    const { inboundDbPath } = await import('../mailbox/sqlite/paths.js');
 
     // Simulate what the adapter bridge does: stringify content, call routeInbound
     const inboundContent = { sender: 'TestUser', senderId: 'u1', text: 'Hello from adapter', isFromMe: false };
@@ -307,7 +310,7 @@ describe('channel + router integration', () => {
     });
 
     // Verify session was created and message written
-    const session = findSession('mg-1', null);
+    const session = await findSession('mg-1', null);
     expect(session).toBeDefined();
 
     const dbPath = inboundDbPath('ag-1', session!.id);

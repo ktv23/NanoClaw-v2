@@ -18,6 +18,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { AnchoredDir } from '../anchored-dir.js';
 import { mcpServerPluginOwner, resolveGroupTimezone, type McpServerConfig } from '../container-config.js';
 import { getAgentGroup, getAllAgentGroups } from '../db/agent-groups.js';
 import { getContainerConfig, updateContainerConfigJson } from '../db/container-configs.js';
@@ -26,15 +27,15 @@ import { resolveGroupFolderPath } from '../group-folder.js';
 import { PERSONA_PREPEND_FILE, readGroupPersona } from '../group-persona.js';
 import { log } from '../log.js';
 import { createScheduledTask, taskNameSlug } from '../modules/scheduling/create.js';
-import { deleteTask, parseTaskContent, updateTask } from '../modules/scheduling/db.js';
-import { inboundDbPath, withInboundDb } from '../session-manager.js';
+import { parseTaskContent } from '../modules/scheduling/task-content.js';
+import { withExistingMailboxSession } from '../session-manager.js';
 import type { AgentGroup } from '../types.js';
 import { groupSkillsOverlayDir, markPluginServers } from './create-agent.js';
 import { resolveLocalTemplate } from './local-dir.js';
 import { parsePluginManifest, PLUGIN_MANIFEST_FILE } from './manifest.js';
 import { pluginDataCwdSubpaths } from './mcp.js';
 import { parseTemplate, type Template } from './parse.js';
-import { copyPluginDir } from './plugin-dir.js';
+import { copyPluginDir, walkPluginDir } from './plugin-dir.js';
 import { prepareTemplateTasks } from './tasks.js';
 
 export interface RestampChange {
@@ -63,7 +64,7 @@ export interface RestampResult {
  * manifest (the full walk/caps/lint pass runs in the stamp it gates, not in
  * this probe).
  */
-export function groupsCarryingPlugin(ref: string): AgentGroup[] {
+export async function groupsCarryingPlugin(ref: string, groups?: readonly AgentGroup[]): Promise<AgentGroup[]> {
   const dir = resolveLocalTemplate(ref);
   const manifestPath = path.join(dir, PLUGIN_MANIFEST_FILE);
   // The fast path reads ONLY a regular manifest file. Anything else — absent
@@ -74,7 +75,7 @@ export function groupsCarryingPlugin(ref: string): AgentGroup[] {
     parseTemplate(dir);
   }
   const manifest = parsePluginManifest(JSON.parse(fs.readFileSync(manifestPath, 'utf-8')));
-  return getAllAgentGroups().filter((g) =>
+  return (groups ?? (await getAllAgentGroups())).filter((g) =>
     fs.existsSync(path.join(resolveGroupFolderPath(g.folder), 'plugins', manifest.name, PLUGIN_MANIFEST_FILE)),
   );
 }
@@ -84,10 +85,14 @@ export function groupsCarryingPlugin(ref: string): AgentGroup[] {
  * before any mutation when the group is missing, the group doesn't carry this
  * plugin, either plugin copy fails validation, or a template task is invalid.
  */
-export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts: { apply: boolean }): RestampResult {
-  const group = getAgentGroup(agentGroupId);
+export async function restampAgentFromTemplate(
+  ref: string,
+  agentGroupId: string,
+  opts: { apply: boolean },
+): Promise<RestampResult> {
+  const group = await getAgentGroup(agentGroupId);
   if (!group) throw new Error(`Agent group not found: ${agentGroupId}`);
-  const configRow = getContainerConfig(group.id);
+  const configRow = await getContainerConfig(group.id);
   if (!configRow) throw new Error(`No container config for group: ${group.id}`);
 
   const tpl = parseTemplate(resolveLocalTemplate(ref));
@@ -112,11 +117,11 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   // can half-apply over an invalid task file. NEW-side only: the old parsed
   // copy is tolerated as-is, so an already-stamped bad template stays
   // restampable to a fixed version.
-  const preparedTasks = prepareTemplateTasks(tpl.tasks, resolveGroupTimezone(group.id));
+  const preparedTasks = prepareTemplateTasks(tpl.tasks, await resolveGroupTimezone(group.id));
   const newTaskSlugs = new Set(tpl.tasks.map((task) => taskNameSlug(task.name)));
 
   const changes: RestampChange[] = [];
-  const ops: Array<() => void> = [];
+  const ops: Array<() => void | Promise<void>> = [];
 
   // --- plugin files: plugins/<name> replaced wholesale ---------------------
   if (dirsEqual(tpl.dir, oldPluginDir)) {
@@ -130,9 +135,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
     });
     ops.push(() => {
       copyPluginDir(tpl.dir, oldPluginDir);
-      // plugin-data sits in the container-RW group mount (unlike plugins/,
-      // which is its own RO mountpoint) — same symlink rules as every write.
-      mkdirRealWithin(groupDir, path.join(groupDir, 'plugin-data', tpl.name));
+      withWritableDir(groupDir, ['plugin-data', tpl.name], () => {});
     });
   }
 
@@ -140,10 +143,12 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   // when plugins/<name> is byte-identical. An engine upgrade changes what the
   // same template ref stamps (a cwd server the old engine skipped appears on
   // restamp with no plugin-file diff), and the dir may also have been deleted
-  // since the last stamp. Idempotent; mkdirRealWithin creates parents.
+  // since the last stamp. Missing parents are created through pinned directories.
   ops.push(() => {
     for (const sub of pluginDataCwdSubpaths(tpl.mcpServers)) {
-      mkdirRealWithin(groupDir, path.join(groupDir, 'plugin-data', tpl.name, sub));
+      // The cwd validator accepts a trailing root slash and current-directory segments.
+      const segments = sub.split('/').filter((segment) => segment !== '' && segment !== '.');
+      withWritableDir(groupDir, ['plugin-data', tpl.name, ...segments], () => {});
     }
   });
 
@@ -151,7 +156,6 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   const livePersona = readGroupPersona(groupDir);
   const oldPersona = old.instructions?.trim() || undefined;
   const newPersona = tpl.instructions?.trim() || undefined;
-  const personaFile = path.join(groupDir, PERSONA_PREPEND_FILE);
   if (newPersona !== undefined) {
     if (livePersona === newPersona) {
       changes.push({ surface: 'persona', name: PERSONA_PREPEND_FILE, action: 'unchanged' });
@@ -163,11 +167,10 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
         ...(livePersona !== null && livePersona !== oldPersona ? { customized: true } : {}),
       });
       ops.push(() => {
-        // rm-then-exclusive-write: the rm removes a planted symlink itself
-        // (never its target), and `wx` makes a link re-planted in the race
-        // window a loud failure instead of a write-through.
-        fs.rmSync(personaFile, { force: true });
-        fs.writeFileSync(personaFile, `${tpl.instructions!.trimEnd()}\n`, { flag: 'wx' });
+        withWritableDir(groupDir, [], (dir) => {
+          dir.remove(PERSONA_PREPEND_FILE);
+          dir.writeNewFile(PERSONA_PREPEND_FILE, Buffer.from(`${tpl.instructions!.trimEnd()}\n`));
+        });
       });
     }
   } else if (oldPersona !== undefined && livePersona !== null) {
@@ -177,7 +180,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
       action: 'remove',
       ...(livePersona !== oldPersona ? { customized: true } : {}),
     });
-    ops.push(() => fs.rmSync(personaFile, { force: true }));
+    ops.push(() => withWritableDir(groupDir, [], (dir) => dir.remove(PERSONA_PREPEND_FILE)));
   }
 
   // --- context extras ------------------------------------------------------
@@ -185,6 +188,8 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   const newContext = new Map(tpl.contextExtras.map((e) => [e.name, e.content]));
   for (const name of new Set([...oldContext.keys(), ...newContext.keys()])) {
     const target = contextTarget(groupDir, name);
+    const segments = name.split('/');
+    const leaf = segments.pop()!;
     const live = fs.existsSync(target) && fs.statSync(target).isFile() ? fs.readFileSync(target, 'utf-8') : undefined;
     const wanted = newContext.get(name);
     if (wanted !== undefined) {
@@ -199,9 +204,10 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
         ...(live !== undefined && live !== oldContext.get(name) ? { customized: true } : {}),
       });
       ops.push(() => {
-        mkdirRealWithin(groupDir, path.dirname(target));
-        fs.rmSync(target, { force: true });
-        fs.writeFileSync(target, wanted, { flag: 'wx' });
+        withWritableDir(groupDir, segments, (dir) => {
+          dir.remove(leaf);
+          dir.writeNewFile(leaf, Buffer.from(wanted));
+        });
       });
     } else if (live !== undefined) {
       changes.push({
@@ -210,21 +216,29 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
         action: 'remove',
         ...(live !== oldContext.get(name) ? { customized: true } : {}),
       });
-      ops.push(() => {
-        mkdirRealWithin(groupDir, path.dirname(target));
-        fs.rmSync(target, { force: true });
-      });
+      ops.push(() => withWritableDir(groupDir, segments, (dir) => dir.remove(leaf)));
     }
   }
 
   // --- skills overlay ------------------------------------------------------
   const overlayRoot = groupSkillsOverlayDir(group.id);
-  // The overlay's parent (.claude-shared) is host-provisioned, but the
-  // container can replace `skills` itself with a symlink — verify before
-  // every apply-phase write under it.
-  const ensureOverlayRoot = (): void => {
-    fs.mkdirSync(path.dirname(overlayRoot), { recursive: true });
-    mkdirRealWithin(path.dirname(overlayRoot), overlayRoot);
+  // .claude-shared is host-owned; open the writable skills child through it.
+  const copySkill = (srcDir: string, name: string): void => {
+    const files = walkPluginDir(srcDir);
+    const source = AnchoredDir.open(srcDir, []);
+    if (!source) throw new Error(`Skill source disappeared: ${srcDir}`);
+    try {
+      withWritableDir(path.dirname(overlayRoot), ['skills'], (dir) => {
+        dir.remove(name, true);
+        dir.copyFiles(
+          source,
+          name,
+          files.map((file) => file.rel),
+        );
+      });
+    } finally {
+      source.close();
+    }
   };
   const oldSkills = new Map(old.skills.map((s) => [s.name, s.srcDir]));
   const newSkills = new Map(tpl.skills.map((s) => [s.name, s.srcDir]));
@@ -238,10 +252,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
         action: 'create',
         ...(oldSrc !== undefined ? { customized: true, note: 'was removed locally; recreated' } : {}),
       });
-      ops.push(() => {
-        ensureOverlayRoot();
-        copyPluginDir(srcDir, overlay);
-      });
+      ops.push(() => copySkill(srcDir, name));
     } else if (dirsEqual(overlay, srcDir)) {
       changes.push({ surface: 'skill', name, action: 'unchanged' });
     } else {
@@ -251,10 +262,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
         action: 'update',
         ...(oldSrc === undefined || !dirsEqual(overlay, oldSrc) ? { customized: true } : {}),
       });
-      ops.push(() => {
-        ensureOverlayRoot();
-        copyPluginDir(srcDir, overlay);
-      });
+      ops.push(() => copySkill(srcDir, name));
     }
   }
   for (const [name, oldSrc] of oldSkills) {
@@ -267,10 +275,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
       action: 'remove',
       ...(!dirsEqual(overlay, oldSrc) ? { customized: true } : {}),
     });
-    ops.push(() => {
-      ensureOverlayRoot();
-      fs.rmSync(overlay, { recursive: true, force: true });
-    });
+    ops.push(() => withWritableDir(path.dirname(overlayRoot), ['skills'], (dir) => dir.remove(name, true)));
   }
 
   // --- MCP servers (by ownership marker) -----------------------------------
@@ -316,7 +321,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
     delete next[name];
     mcpDirty = true;
   }
-  if (mcpDirty) ops.push(() => updateContainerConfigJson(group.id, 'mcp_servers', next));
+  if (mcpDirty) ops.push(async () => await updateContainerConfigJson(group.id, 'mcp_servers', next));
 
   // --- tasks (matched by name slug; pause/resume state is operator-owned) --
   // Old-side tasks are keyed by SLUG — the identity live series carry. A rename
@@ -325,7 +330,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   const oldTasks = new Map(old.tasks.map((t) => [taskNameSlug(t.name), t]));
   for (const task of tpl.tasks) {
     const prepared = preparedTasks.get(task.name)!;
-    const match = findTaskSeriesBySlug(group.id, taskNameSlug(task.name));
+    const match = await findTaskSeriesBySlug(group.id, taskNameSlug(task.name));
     const oldTask = oldTasks.get(taskNameSlug(task.name));
     // A dead series (no live row, nothing armed to re-arm) is history, not a
     // task — a fresh series is created alongside it.
@@ -338,7 +343,9 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
           ? { customized: true, note: 'was removed locally; recreated paused' }
           : { note: 'created paused' }),
       });
-      ops.push(() => void createScheduledTask(group.id, prepared, { status: 'paused' }));
+      ops.push(async () => {
+        await createScheduledTask(group.id, prepared, { status: 'paused' });
+      });
       continue;
     }
     if (!match.live) {
@@ -371,9 +378,9 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
       ...(customized ? { customized: true } : {}),
       note: `series ${match.seriesId}; status "${match.status}" kept`,
     });
-    ops.push(() => {
-      withInboundDb(group.id, match.sessionId, (db) =>
-        updateTask(db, match.seriesId, {
+    ops.push(async () => {
+      await withExistingMailboxSession(group.id, match.sessionId, (mailbox) =>
+        mailbox.updateTask(match.seriesId, {
           prompt: prepared.prompt,
           script: prepared.script,
           ...(match.recurrence !== prepared.recurrence
@@ -385,7 +392,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   }
   for (const [slug, oldTask] of oldTasks) {
     if (newTaskSlugs.has(slug)) continue;
-    const match = findTaskSeriesBySlug(group.id, slug);
+    const match = await findTaskSeriesBySlug(group.id, slug);
     // Nothing to remove when the series is already dead history.
     if (match === undefined || (!match.live && match.recurrence === null)) continue;
     changes.push({
@@ -394,8 +401,8 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
       action: 'remove',
       note: `series ${match.seriesId} deleted (was ${match.status})`,
     });
-    ops.push(() => {
-      withInboundDb(group.id, match.sessionId, (db) => deleteTask(db, match.seriesId));
+    ops.push(async () => {
+      await withExistingMailboxSession(group.id, match.sessionId, (mailbox) => mailbox.deleteTask(match.seriesId));
     });
   }
 
@@ -406,7 +413,7 @@ export function restampAgentFromTemplate(ref: string, agentGroupId: string, opts
   if (opts.apply) {
     for (const [index, op] of ops.entries()) {
       try {
-        op();
+        await op();
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(
@@ -464,21 +471,15 @@ function listFilesRecursive(root: string): Map<string, string> {
   return out;
 }
 
-/**
- * Create `dir` (under trusted, existing `base`) for an apply-phase write. The
- * group dir and skills overlay are container-writable, so an agent-planted
- * symlink could redirect a host-side write anywhere: the deepest EXISTING
- * ancestor must resolve inside `base` before the rest is created (freshly
- * created components cannot be symlinks).
- */
-function mkdirRealWithin(base: string, dir: string): void {
-  let existing = dir;
-  while (!fs.existsSync(existing)) existing = path.dirname(existing);
-  const rel = path.relative(fs.realpathSync(base), fs.realpathSync(existing));
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`refusing to write through "${dir}": it resolves outside the agent's own directories`);
+/** Pin writable descendants of a stable root for the entire operation. */
+function withWritableDir(root: string, segments: string[], action: (dir: AnchoredDir) => void): void {
+  const dir = AnchoredDir.open(root, segments, true);
+  if (!dir) throw new Error(`Restamp directory disappeared: ${path.join(root, ...segments)}`);
+  try {
+    action(dir);
+  } finally {
+    dir.close();
   }
-  fs.mkdirSync(dir, { recursive: true });
 }
 
 /**
@@ -518,26 +519,17 @@ interface TaskSeriesMatch {
  * match in ANY state — a recurring series between a run completing and the
  * sweep re-arming it (≤60s) has only completed rows but is still alive.
  */
-function findTaskSeriesBySlug(agentGroupId: string, slug: string): TaskSeriesMatch | undefined {
+async function findTaskSeriesBySlug(agentGroupId: string, slug: string): Promise<TaskSeriesMatch | undefined> {
   if (!slug) return undefined;
-  const pattern = `${slug}-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]`;
-  for (const session of [...findTaskSessions(agentGroupId)].reverse()) {
-    if (!fs.existsSync(inboundDbPath(agentGroupId, session.id))) continue;
-    const row = withInboundDb(agentGroupId, session.id, (db) =>
-      db
-        .prepare(
-          `SELECT series_id, status, recurrence, content FROM messages_in
-            WHERE kind = 'task' AND series_id GLOB ?
-            ORDER BY CASE WHEN status IN ('pending', 'paused') THEN 0 ELSE 1 END, seq DESC
-            LIMIT 1`,
-        )
-        .get(pattern),
-    ) as { series_id: string; status: string; recurrence: string | null; content: string } | undefined;
-    if (!row) continue;
+  for (const session of [...(await findTaskSessions(agentGroupId))].reverse()) {
+    const row = await withExistingMailboxSession(agentGroupId, session.id, (mailbox) =>
+      mailbox.findTaskBySeriesSlug(slug),
+    );
+    if (!row?.seriesId) continue;
     const content = parseTaskContent(row.content);
     return {
       sessionId: session.id,
-      seriesId: row.series_id,
+      seriesId: row.seriesId,
       live: row.status === 'pending' || row.status === 'paused',
       status: row.status,
       recurrence: row.recurrence,

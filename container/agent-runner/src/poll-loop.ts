@@ -6,19 +6,24 @@ import {
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, getOutboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { getUndeliveredMessages, writeMessageOut, type MessageOutRow } from './db/messages-out.js';
+import { clearStaleProcessingAcks } from './db/container-state.js';
+import { resolveDestinationThread } from './db/session-routing.js';
+import { touchHeartbeat } from './heartbeat.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import {
   clearContinuation,
-  clearCurrentInReplyTo,
+  clearCurrentReplyRoute,
   migrateLegacyContinuation,
   setContinuation,
-  setCurrentInReplyTo,
+  setCurrentReplyRoute,
 } from './db/session-state.js';
 import {
   formatMessages,
   extractRouting,
   categorizeMessage,
+  FAILURE_NOTICE_FIELD,
+  GENERIC_FAILURE_NOTICE,
   isClearCommand,
   isRunnerCommand,
   isSessionEcho,
@@ -26,45 +31,15 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
-import { loadGate, promptHasAllowedTrigger } from './gatekeeper.js';
-import { setCurrentTurn } from './trigger-match.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 
-/**
- * Hard game-lookup gate, resolved once from the mounted skills at startup
- * (skills are a read-only mount fixed for the container's life). Null unless an
- * enforcing "gatekeeper" skill is mounted — so this is inert for every bot
- * except a locked lookup bot. See ./gatekeeper.ts.
- */
-const GATEKEEPER = loadGate();
-
-/**
- * Number of consecutive `database disk image is malformed` errors after which
- * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
- * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
- * read during a host write, short enough to recover quickly from a poisoned
- * page cache (host-sweep then respawns with a fresh mount).
- */
-const CORRUPTION_STREAK_EXIT = 10;
-
-/**
- * True for SQLite errors that indicate a corrupt READ view — almost always a
- * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
- * actual file damage (host-side integrity_check passes). Reopening the DB
- * handle inside this process does NOT recover; only a fresh container mount
- * does. Caller's job is to exit so host-sweep respawns the container.
- */
-export function isCorruptionError(msg: string): boolean {
-  return (
-    msg.includes('database disk image is malformed') ||
-    msg.includes('SQLITE_CORRUPT') ||
-    msg.includes('file is not a database')
-  );
-}
+/** Consecutive driver-classified failures before a fresh runner is required. */
+const MAILBOX_FAILURE_STREAK_EXIT = 10;
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -76,6 +51,8 @@ function generateId(): string {
 
 export interface PollLoopConfig {
   provider: AgentProvider;
+  /** Declared provider runtime behavior. Contractless providers keep legacy defaults. */
+  providerContract?: Pick<ProviderRuntimeContract, 'textDelivery' | 'commands'>;
   /**
    * Name of the provider (e.g. "claude", "codex", "opencode"). Used to key
    * the stored continuation per-provider so flipping providers doesn't
@@ -97,14 +74,24 @@ export interface PollLoopConfig {
 /**
  * Main poll loop. Runs indefinitely until the process is killed.
  *
- * 1. Poll messages_in for pending rows
+ * 1. Poll the mailbox for pending messages
  * 2. Format into prompt, call provider.query()
  * 3. While query active: continue polling, push new messages via provider.push()
- * 4. On result: write messages_out
+ * 4. On result: write outbound messages
  * 5. Mark messages completed
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+  // Contract providers declare these; a contractless (legacy payload)
+  // provider keeps declaring them as instance flags, exactly as before.
+  const legacy = config.provider as { supportsNativeSlashCommands?: boolean; emitsMidTurnText?: boolean };
+  const nativeSlashCommands = config.providerContract
+    ? config.providerContract.commands.formatting === 'native'
+    : (legacy.supportsNativeSlashCommands ?? false);
+  const midTurnCompleteDelivery = config.providerContract
+    ? config.providerContract.textDelivery === 'mid-turn-complete'
+    : (legacy.emitsMidTurnText ?? false);
+
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
@@ -132,6 +119,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
+  // Same for the reply stamp a killed container left behind (see session-state.ts).
+  clearCurrentReplyRoute();
 
   let pollCount = 0;
   let isFirstPoll = true;
@@ -159,7 +148,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // query. Without this gate, a warm container keeps processing
     // (and potentially responding to) every accumulate-only batch, defeating
     // the "store as context, don't engage" contract. Host-side countDueMessages
-    // gates the same way for wake-from-cold (see src/db/session-db.ts).
+    // gates the same way for wake-from-cold through countDueMessages().
     if (!messages.some((m) => m.trigger === 1)) {
       await sleep(POLL_INTERVAL_MS);
       continue;
@@ -181,7 +170,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
         clearContinuation(config.providerName);
-        writeMessageOut({
+        await writeMessageOut({
           id: generateId(),
           kind: 'chat',
           platform_id: routing.platformId,
@@ -196,13 +185,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // ambient context, never a runner command (isClearCommand self-guards).
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && !isSessionEcho(msg) && isUploadTraceCommand(msg)) {
         log('Uploading session trace to Hugging Face');
-        writeMessageOut({
+        await writeMessageOut({
           id: generateId(),
           kind: 'chat',
           platform_id: routing.platformId,
           channel_type: routing.channelType,
           thread_id: routing.threadId,
-          content: JSON.stringify({ text: uploadTrace() }),
+          content: JSON.stringify({ text: uploadTrace(config.providerName) }),
         });
         commandIds.push(msg.id);
         continue;
@@ -244,39 +233,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // MODULE-HOOK:lookup-gate:start
+    const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+    keep = await gateLookupBatch(keep, config.providerName);
+    if (keep.length === 0) continue;
+    // MODULE-HOOK:lookup-gate:end
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
-
-    // Publish the current turn = the newest wake (trigger=1) message, so the
-    // gate below AND the per-game directive in providers/claude.ts both classify
-    // the message that engaged this turn, not a trigger=0 context row that sorts
-    // last by seq (which over-blocked real codes and leaked code-less turns).
-    publishCurrentTurn(keep);
-
-    // MODULE-HOOK:gatekeeper:start
-    // Hard game-lookup gate. When an enforcing gatekeeper skill is mounted and
-    // this user-chat turn carries no allowed game trigger, deliver the fallback
-    // usage card and end the turn WITHOUT calling the provider — the model can
-    // never produce a generic answer for a code-less message. Restricted to
-    // user chat so tasks/webhooks/system messages pass straight through.
-    if (GATEKEEPER && keep.every((m) => m.kind === 'chat' || m.kind === 'chat-sdk')) {
-      if (!promptHasAllowedTrigger(prompt, GATEKEEPER.allowedTriggers)) {
-        writeMessageOut({
-          id: generateId(),
-          in_reply_to: routing.inReplyTo,
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: GATEKEEPER.fallbackMessage }),
-        });
-        markCompleted(keep.map((m) => m.id));
-        log(`Gatekeeper: no game trigger in turn — sent usage card, skipped query`);
-        continue;
-      }
-    }
-    // MODULE-HOOK:gatekeeper:end
+    const prompt = formatMessagesWithCommands(keep, nativeSlashCommands, config.providerName);
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
@@ -286,13 +251,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       cwd: config.cwd,
       systemContext: config.systemContext,
     });
-
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped.map((s) => s.id));
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
-    // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
-    // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // Publish the batch's route so MCP tools (send_message, send_file) thread
+    // replies into the conversation being answered and stamp in_reply_to for
+    // a2a return-path routing. Re-published at every turn boundary inside
+    // processQuery as later messages are answered.
+    publishReplyRoute(routing);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -312,15 +278,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
-        config.provider.emitsMidTurnText === true,
+        midTurnCompleteDelivery,
+        config.signal,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
+      log(`Query error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
 
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
@@ -331,22 +297,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // processQuery owns failure notices: it knows which active and queued
+      // turns the failure abandoned. The opening batch may already be done.
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
       // followed by a "Completed" line that reads like success.
       log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
     } finally {
-      clearCurrentInReplyTo();
+      clearCurrentReplyRoute();
       config.signal?.removeEventListener('abort', abortActiveQuery);
     }
 
@@ -363,25 +322,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-/**
- * Publish the current turn for trigger detection: the block of the newest wake
- * (trigger=1) message in the batch. The gate and the per-game directive both
- * read this via trigger-match.currentTurnText, so they classify the message
- * that engaged the turn rather than whatever context row sorts last. No wake row
- * (task/system batch) → null, which falls back to the last-block heuristic.
- */
-function publishCurrentTurn(messages: MessageInRow[]): void {
-  const wakeRows = messages.filter((m) => m.trigger === 1);
-  setCurrentTurn(wakeRows.length > 0 ? formatMessages([wakeRows[wakeRows.length - 1]]) : null);
-}
-
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+function formatMessagesWithCommands(
+  messages: MessageInRow[],
+  nativeSlashCommands: boolean,
+  providerName: string,
+): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
     if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
-      const cmdInfo = categorizeMessage(msg);
+      const cmdInfo = categorizeMessage(msg, providerName);
       if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
         // Flush normal batch first
         if (normalBatch.length > 0) {
@@ -416,16 +367,19 @@ export async function processQuery(
   initialPrompt: string,
   initialContinuation: string | undefined,
   /**
-   * The provider's declared `emitsMidTurnText` capability (see
-   * providers/types.ts). True → mid-turn streaming is the single content
+   * The provider contract's `textDelivery: 'mid-turn-complete'`. True →
+   * mid-turn streaming is the single content
    * door: complete <message> blocks deliver exactly once, at parse time from
    * streamed 'text' events (with cross-segment assembly of split blocks),
    * and the final result never delivers content — it only surfaces error
    * results and decides the wrap-nudge. False → text events are
    * delivery-inert and the final result stays the single delivery door.
    */
-  emitsMidTurnText = false,
+  midTurnCompleteDelivery = false,
+  signal?: AbortSignal,
 ): Promise<QueryResult> {
+  // adoptTurn mutates routing in place; keep the caller's batch route intact.
+  routing = { ...routing };
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
@@ -433,13 +387,16 @@ export async function processQuery(
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
   // How many <message> blocks were delivered from 'text' events this turn
-  // (chat runs, emitsMidTurnText providers only). A frame-local count, never
+  // (chat runs, mid-turn delivery providers only). A frame-local count, never
   // keyed by content: it feeds the result door's nudge decision ("did this
   // turn deliver anything?"). Reset at the turn boundary (the 'result'
   // event) — NOT at the follow-up push seam: query.push() does not end the
   // in-flight turn, and its result's nudge decision still describes the
   // turn that is streaming.
   let midTurnSent = 0;
+  // The subset of midTurnSent that counts as the reply: blocks to another
+  // agent are left out (see answersBatch).
+  let midTurnReplied = 0;
   // Outbound seq high-water mark at the turn boundary — a frame-local NUMBER,
   // not a content record. Two uses: (1) the mid-turn door recognizes a block
   // that is a verbatim repeat of a message already written to outbound.db
@@ -463,10 +420,43 @@ export async function processQuery(
   // closes anywhere is the wrap-nudge's job, not the buffer's.
   let midTurnTail = '';
   // Prompt queue for the exchange hook — each result event consumes the
-  // oldest unanswered prompt, except a wrapping-retry result, which answers
-  // the same prompt again. Unused (and unmaintained) when the provider
-  // doesn't implement `onExchangeComplete`.
-  const archivePrompts: string[] = [initialPrompt];
+  // oldest unanswered prompt. Retries append the original user prompt at
+  // their position in the provider input queue.
+  const archivePrompts: string[] = initialPrompt ? [initialPrompt] : [];
+  // Where replies go is a property of the TURN, not the query. The query
+  // stays open across turns (below), so a message pushed after the previous
+  // answer finished is a new turn and replies go to ITS thread; a message
+  // pushed while an answer is still streaming waits its turn — the in-flight
+  // answer keeps the destination it started with. Pushed routes queue in
+  // push order (including retries) and advance at every result, mirroring
+  // archivePrompts. An empty initial prompt (a pre-warmed query) starts idle.
+  let answering = initialPrompt !== '';
+  type QueuedTurn = {
+    routing: RoutingContext;
+    unwrappedNudged: boolean;
+    taskBlockNudged: boolean;
+    nudgedWindow?: SeqWindow;
+  };
+  const queuedTurns: QueuedTurn[] = [];
+  // On a wrap-nudge retry: the rows the nudged turn wrote. The turn boundary
+  // moved past them, so both doors check retry blocks against this window and
+  // skip exact repeats. Follow-ups queued in between keep their own window.
+  let nudgedWindow: SeqWindow | undefined;
+  const adoptTurn = (next: QueuedTurn): void => {
+    Object.assign(routing, next.routing);
+    unwrappedNudged = next.unwrappedNudged;
+    taskBlockNudged = next.taskBlockNudged;
+    nudgedWindow = next.nudgedWindow;
+    publishReplyRoute(routing);
+    answering = true;
+  };
+  // A retry is another provider input, behind any follow-ups already pushed.
+  // Preserve its original route, prompt and retry guards until it is answered.
+  const pushRetry = (prompt: string, retryOf?: SeqWindow): void => {
+    query.push(prompt);
+    queuedTurns.push({ routing: { ...routing }, unwrappedNudged, taskBlockNudged, nudgedWindow: retryOf });
+    archivePrompts.push(archivePrompts[0] ?? initialPrompt);
+  };
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -479,24 +469,8 @@ export async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
-  let corruptionStreak = 0;
-  // True only while a post-init turn is actively streaming (between the turn's
-  // first work and its `result`). Gates the periodic heartbeat touch below so
-  // the host's interim "still working" nudge — which requires a fresh heartbeat
-  // (<15s) — fires on time even across a long no-event stretch (SDK compaction,
-  // a slow single tool call). Left false while IDLE between turns so an idle
-  // container's heartbeat goes stale and the host's 30-min ceiling recycles it,
-  // and left false before the first 'init' so a pre-init resume/startup hang
-  // keeps the heartbeat frozen for host-sweep's 60s kill-claim. Post-init
-  // mid-turn wedges were already ceiling-only (kill-claim can't fire once the
-  // heartbeat advanced past the claim), so feeding the heartbeat here weakens
-  // no detection we had.
-  let turnInFlight = false;
+  let mailboxFailureStreak = 0;
   const pollHandle = setInterval(() => {
-    // Liveness heartbeat during an active turn: the SDK can go many seconds
-    // without emitting an event (the only other thing that touches the
-    // heartbeat), which would otherwise starve the interim nudge.
-    if (turnInFlight) touchHeartbeat();
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
@@ -514,7 +488,7 @@ export async function processQuery(
         // not end: end() lets an in-flight turn run to completion, which
         // can block the command (e.g. /clear during a long task) for as
         // long as the turn takes.
-        if (pending.some((m) => isRunnerCommand(m))) {
+        if (pending.some((m) => isRunnerCommand(m, providerName))) {
           log('Pending slash command — aborting active stream so outer loop can process');
           endedForCommand = true;
           query.abort();
@@ -562,6 +536,11 @@ export async function processQuery(
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
         if (keep.length === 0) return;
+        // MODULE-HOOK:lookup-gate-followup:start
+        const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+        keep = await gateLookupBatch(keep, providerName);
+        if (keep.length === 0) return;
+        // MODULE-HOOK:lookup-gate-followup:end
         // Re-check done — the outer query may have finished while the script
         // was awaited. Pushing into a closed stream is wasted work; the
         // claimed messages get released by the host's processing-claim sweep.
@@ -569,46 +548,17 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
-
-        // Publish the current turn + run the hard gate here too: a code-less
-        // message that arrives while the container is warm is pushed into the
-        // active query, which previously bypassed the gate entirely — a locked
-        // lookup bot would then answer an off-topic follow-up from memory.
-        publishCurrentTurn(keep);
-        if (
-          GATEKEEPER &&
-          keep.every((m) => m.kind === 'chat' || m.kind === 'chat-sdk') &&
-          !promptHasAllowedTrigger(prompt, GATEKEEPER.allowedTriggers)
-        ) {
-          const fr = extractRouting(keep);
-          writeMessageOut({
-            id: generateId(),
-            in_reply_to: fr.inReplyTo,
-            kind: 'chat',
-            platform_id: fr.platformId,
-            channel_type: fr.channelType,
-            thread_id: fr.threadId,
-            content: JSON.stringify({ text: GATEKEEPER.fallbackMessage }),
-          });
-          markCompleted(keptIds);
-          log('Gatekeeper: follow-up carried no game trigger — sent usage card, not pushed');
-          return;
-        }
-
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
-        unwrappedNudged = false;
-        taskBlockNudged = false;
-        // Re-stamp the a2a reply id for THIS pushed batch. current_in_reply_to
-        // is set once at the initial batch start (line ~288); send_message /
-        // send_file read it, so without this a reply the model produces for a
-        // follow-up would be stamped with the ORIGINAL batch's first message —
-        // a wrong reply-quote, and in agent-to-agent a cross-session misroute
-        // (the follow-up's answer return-routed to the original requester).
-        setCurrentInReplyTo(extractRouting(keep).inReplyTo);
         query.push(prompt);
         archivePrompts.push(prompt);
+        const next: QueuedTurn = {
+          routing: extractRouting(keep),
+          unwrappedNudged: false,
+          taskBlockNudged: false,
+        };
+        if (answering) queuedTurns.push(next);
+        else adoptTurn(next);
         markCompleted(keptIds);
-        turnInFlight = true; // a follow-up turn is now streaming
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -617,18 +567,12 @@ export async function processQuery(
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
 
-        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
-        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
-        // bind mount can latch a torn snapshot mid-host-write, after which
-        // every fresh openInboundDb() in this process sees the same broken
-        // view. Reopening inside the container does NOT recover; only a fresh
-        // container mount does. Exit so the host sweep respawns us.
-        if (isCorruptionError(errMsg)) {
-          corruptionStreak += 1;
-          if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
+        if (getAgentMailbox().shouldRestartAfter?.(err)) {
+          mailboxFailureStreak += 1;
+          if (mailboxFailureStreak >= MAILBOX_FAILURE_STREAK_EXIT) {
             log(
-              `Follow-up poll: ${corruptionStreak} consecutive '${errMsg}' errors — ` +
-                `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+              `Follow-up poll: ${mailboxFailureStreak} consecutive '${errMsg}' errors — ` +
+                `mailbox driver requested a fresh runner. Exiting so the host respawns it.`,
             );
             // Stop touching the heartbeat so host-sweep stale detection fires
             // promptly even if exit() races with in-flight async work.
@@ -639,7 +583,7 @@ export async function processQuery(
             setTimeout(() => process.exit(75), 100);
           }
         } else {
-          corruptionStreak = 0;
+          mailboxFailureStreak = 0;
         }
       } finally {
         pollInFlight = false;
@@ -654,10 +598,6 @@ export async function processQuery(
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
-        // The SDK session is live (any resume is done) — the first turn is now
-        // streaming, so from here the periodic heartbeat may run. Before this a
-        // pre-init hang leaves the heartbeat frozen so kill-claim (60s) fires.
-        turnInFlight = true;
         // Persist immediately so a mid-turn container crash still lets the
         // next wake resume the conversation. Without this, the session id
         // was only written after the full stream completed — if the
@@ -670,12 +610,13 @@ export async function processQuery(
         // final result only carries the LAST assistant text, so complete
         // <message> blocks composed here would otherwise be lost — deliver
         // them now (chat runs only; task runs stay one-door). Gated on the
-        // provider's static capability: for a provider that does not declare
-        // emitsMidTurnText the result stays the only delivery door, so a
-        // stray text event must not open a second one.
-        if (emitsMidTurnText) {
-          const scan = deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
+        // provider contract: for a provider that does not declare mid-turn
+        // delivery the result stays the only delivery door, so a stray text
+        // event must not open a second one.
+        if (midTurnCompleteDelivery) {
+          const scan = await deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail, nudgedWindow);
           midTurnSent += scan.delivered;
+          midTurnReplied += scan.replied;
           midTurnTail = scan.tail;
         }
       } else if (event.type === 'result') {
@@ -686,85 +627,83 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        // Turn boundary → idle until the next push: stop feeding the heartbeat
-        // so an idle container ages out under the host ceiling. A retry pushed
-        // below (wrap / task-block nudge) re-arms it.
-        turnInFlight = false;
-        if (event.text) {
-          const { sent, hasUnwrapped, taskBlocks, resultBlocks } = dispatchResultText(event.text, routing, {
+        const resultText = event.text ?? '';
+        const failed = event.isError === true;
+        if (resultText || failed) {
+          const { hasUnwrapped, taskBlocks, undelivered } = await dispatchResultText(resultText, routing, {
             midTurnSent,
-            // For emitsMidTurnText providers the result door NEVER delivers
-            // content (error results excepted, below): mid-turn streaming is
-            // the single content door. The result door's remaining job is
-            // the nudge decision — see turnDelivered.
-            suppressDelivery: emitsMidTurnText,
-            // "Did anything user-visible go out this turn?" — door
-            // deliveries (midTurnSent) plus any chat row written since the
-            // turn boundary (which also sees MCP send_message calls the
-            // frame-local count can't). When false and the result still
-            // carries content, the wrap-nudge fires so the model re-sends
-            // and the retry streams through the mid-turn door.
-            turnDelivered: emitsMidTurnText ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
+            midTurnReplied,
+            turnStartSeq,
+            nudgedWindow,
+            // For mid-turn delivery providers the result door NEVER delivers
+            // content: mid-turn streaming is the single content door. The
+            // result door's remaining job is the nudge decision.
+            suppressDelivery: midTurnCompleteDelivery,
           });
-          const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
+          // Completed partial output remains deliverable, but an explicit
+          // provider failure must keep its status and never trigger a retry.
+          const willRetryTaskBlocks = !failed && shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
           // while explicit append-log calls remain optional additive notes.
           // Errors included: a failed run's text belongs in its log, not chat.
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
-          if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
-          if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
-            // Non-retryable error turn (e.g. a 403 billing_error) with no
-            // <message> envelope: deliver the notice instead of dropping it as
-            // scratchpad, and skip the re-wrap nudge — it would just re-hammer
-            // the failing gateway turn after turn.
-            deliverErrorResult(event.text, routing);
-            notifyExchangeComplete(onExchangeComplete, {
-              prompt: archivePrompts[0] ?? initialPrompt,
-              result: event.text,
-              continuation: queryContinuation ?? initialContinuation,
-              status: 'error',
-            });
-            archivePrompts.shift();
-          } else {
-            // An unwrapped final text only warrants the wrap-nudge when NOTHING
-            // was delivered this turn — hasUnwrapped already folds in the
-            // turn's mid-turn sent count. If a reply already went out as a
-            // mid-turn block, the unwrapped tail is a self-summary; nudging
-            // coaxes a redundant second message (live-observed). It stays in
-            // the scratchpad log.
-            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
-            notifyExchangeComplete(onExchangeComplete, {
-              prompt: archivePrompts[0] ?? initialPrompt,
-              result: event.text,
-              continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
-            });
-            if (willRetryWrapping) {
-              unwrappedNudged = true;
-              const destinations = getAllDestinations();
-              const names = destinations.map((d) => d.name).join(', ');
-              query.push(
-                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                  `Your destinations: ${names}. ` +
-                  `Please re-send your response with the correct wrapping.</system>`,
-              );
-              turnInFlight = true; // retry turn is streaming
-            }
-            if (willRetryTaskBlocks) {
-              taskBlockNudged = true;
-              const names = getAllDestinations()
-                .map((d) => d.name)
-                .join(', ');
-              query.push(buildTaskBlockNudge(taskBlocks, names));
-              turnInFlight = true; // retry turn is streaming
-            }
-            // A retry result (wrapping or task-block nudge) answers the SAME
-            // user prompt — keep it queued so the retry archives against it,
-            // not the nudge text.
-            if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
+          const archivedResult = [resultText, failed ? event.error : undefined].filter(Boolean).join('\n');
+          if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(archivedResult);
+          if (failed) {
+            // A failed turn needs a visible notice even after a partial reply.
+            // Only the provider's dedicated error field is channel content;
+            // unwrapped model output and raw diagnostics remain private.
+            const notice = event.error ?? GENERIC_FAILURE_NOTICE;
+            if (sendsFailureNotice(routing)) await deliverErrorResult(routing, notice);
+            // Keep the reason in the runner log, since the skipped notice may
+            // be the only place it would have been recorded.
+            else log(`Error result — notice not sent on this route: ${notice}`);
           }
+          // An unwrapped final text only warrants the wrap-nudge when no
+          // <message> block was delivered this turn. If a reply already went
+          // out as a block, the unwrapped tail stays in the scratchpad log.
+          const willRetryWrapping = !failed && hasUnwrapped && !unwrappedNudged;
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: archivedResult,
+            continuation: queryContinuation ?? initialContinuation,
+            status: failed ? 'error' : hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+          });
+          if (willRetryWrapping) {
+            unwrappedNudged = true;
+            // Everything that went out this turn: tool sends, door sends and
+            // reactions alike, so a reaction-only turn can also answer done.
+            const sentThisTurn = chatRowsInWindow(turnStartSeq);
+            const destinations = getAllDestinations();
+            const names = destinations.map((d) => d.name).join(', ');
+            // A tool send can't be told apart from an "on it" ack, so after
+            // one the model sees what went out and decides; never a silent drop.
+            log(
+              sentThisTurn.length > 0
+                ? `Wrap-nudge pushed: quoting ${sentThisTurn.length} send(s) from this turn`
+                : 'Wrap-nudge pushed: nothing was sent this turn',
+            );
+            pushRetry(
+              sentThisTurn.length > 0
+                ? buildInformedWrapNudge(sentThisTurn, undelivered, destinations)
+                : `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                    `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                    `Your destinations: ${names}. ` +
+                    `Please re-send your response with the correct wrapping.</system>`,
+              { after: turnStartSeq, upto: maxOutboundSeq() },
+            );
+          }
+          if (willRetryTaskBlocks) {
+            taskBlockNudged = true;
+            const names = getAllDestinations()
+              .map((d) => d.name)
+              .join(', ');
+            pushRetry(buildTaskBlockNudge(taskBlocks, names));
+          }
+          // Each result consumes one input; retries carry their original
+          // user prompt at their own position in the FIFO queue.
+          archivePrompts.shift();
         } else archivePrompts.shift();
         // Turn boundary: reset the per-turn sent count after the result's
         // nudge decision has used it. A nudge retry re-counts via its own
@@ -776,11 +715,20 @@ export async function processQuery(
         // buffer dies with the turn: a fragment that never closed is not
         // carried into the next turn — the wrap-nudge owns that case.
         midTurnSent = 0;
+        midTurnReplied = 0;
         turnStartSeq = maxOutboundSeq();
         midTurnTail = '';
+        nudgedWindow = undefined;
+        const next = queuedTurns.shift();
+        if (next) adoptTurn(next);
+        else answering = false;
       }
     }
   } catch (err) {
+    // Freeze the queue before awaiting notices. Follow-ups have already been
+    // acknowledged, so an abandoned queued turn cannot rely on redelivery.
+    done = true;
+    const cancelled = endedForCommand || signal?.aborted;
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {
       prompt: archivePrompts[0] ?? initialPrompt,
@@ -788,6 +736,38 @@ export async function processQuery(
       continuation: queryContinuation ?? initialContinuation,
       status: 'error',
     });
+    if (!cancelled) {
+      // Completed turns are no longer answering or queued. Preserve partial
+      // output from unfinished turns and report that the run did not finish.
+      // Retrying the same route or several queued turns in one thread needs
+      // only one notice. The host picks an a2a reply's session by in_reply_to,
+      // so agent routes also compare it.
+      const failedRoutes = [...(answering ? [routing] : []), ...queuedTurns.map((turn) => turn.routing)];
+      const noticed: RoutingContext[] = [];
+      for (const target of failedRoutes) {
+        if (!sendsFailureNotice(target)) continue;
+        if (
+          noticed.some(
+            (prior) =>
+              prior.platformId === target.platformId &&
+              prior.channelType === target.channelType &&
+              prior.threadId === target.threadId &&
+              (target.channelType !== 'agent' || prior.inReplyTo === target.inReplyTo),
+          )
+        )
+          continue;
+        noticed.push(target);
+        try {
+          await deliverErrorResult(target, GENERIC_FAILURE_NOTICE);
+        } catch (noticeError) {
+          log(
+            `Failed to deliver query error notice: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`,
+          );
+        }
+      }
+    }
+    // Continuation recovery receives the original error; diagnostics remain
+    // in the exchange archive and runner log, never in the channel notice.
     throw err;
   } finally {
     done = true;
@@ -829,22 +809,25 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
- * Deliver a turn's text straight to the channel the batch arrived on. Used when
- * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
- * no <message> envelope: the notice would otherwise be dropped as scratchpad.
- * This is the same user-facing write the outer catch block does, minus the
- * `Error:` prefix — the provider's text is already a user-facing message.
+ * Does a failure on this route get a notice? Task runs report through their
+ * run log. A turn woken only by failure notices sends none, so an a2a or
+ * self-addressed failure chain stops after one notice.
  */
-function deliverErrorResult(text: string, routing: RoutingContext): void {
-  log('Error result with no <message> envelope — delivering to channel');
-  writeMessageOut({
+function sendsFailureNotice(routing: RoutingContext): boolean {
+  return !routing.taskRun && !!routing.platformId && !!routing.channelType && !routing.failureNoticeWake;
+}
+
+/** Send the dedicated provider error or a generic failure notice. */
+async function deliverErrorResult(routing: RoutingContext, text: string): Promise<void> {
+  log('Error result notice — delivering to channel');
+  await writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
     platform_id: routing.platformId,
     channel_type: routing.channelType,
     thread_id: routing.threadId,
-    content: JSON.stringify({ text: stripHarnessTagArtifacts(text) }),
+    content: JSON.stringify({ text: stripHarnessTagArtifacts(text), [FAILURE_NOTICE_FIELD]: true }),
   });
 }
 
@@ -862,40 +845,39 @@ export interface TaskMessageBlock {
 }
 
 /** Options for `dispatchResultText`, describing the turn it closes. */
-export interface ResultDispatchOptions {
+export type ResultDispatchOptions = ResultDispatchCounts &
+  ({ suppressDelivery: true; turnStartSeq: number } | { suppressDelivery?: false; turnStartSeq?: number });
+
+interface ResultDispatchCounts {
   /**
    * How many <message> blocks were already delivered from streamed text
    * events this turn. Folds into the returned `sent` total so a bare final
    * text after a mid-turn delivery reads as a self-summary, not an
-   * undelivered reply.
+   * undelivered reply. Tool sends never settle the turn here: the caller
+   * turns an unwrapped result after one into an informed nudge.
    */
   midTurnSent?: number;
+  /** The midTurnSent blocks that count as the reply (see answersBatch). Defaults to midTurnSent. */
+  midTurnReplied?: number;
+  /** On a wrap-nudge retry: rows the nudged turn wrote. An exact repeat of one is not sent again. */
+  nudgedWindow?: SeqWindow;
   /**
-   * Providers declaring `emitsMidTurnText`: the result door NEVER delivers
+   * Providers declaring `textDelivery: 'mid-turn-complete'`: the result door NEVER delivers
    * content. Mid-turn streaming (parse-time block delivery plus cross-
    * segment assembly) is the single content door; a complete <message>
    * block in the result text is at best a repeat of a mid-turn delivery and
    * at worst content the streaming door missed — either way it is not sent
    * from here. The result door keeps exactly two jobs: surfacing error
    * results (see the isError branch in processQuery) and the wrap-nudge
-   * decision (`turnDelivered` below). Task runs, unknown destinations and
-   * empty bodies keep their existing result-door handling, none of which
-   * delivers content.
+   * decision. When nothing streamed and the result still carries content,
+   * wrapped or not, the turn counts as undelivered and the wrap-nudge fires,
+   * so the retry streams through the mid-turn door: the degradation path
+   * for streaming-door misses, never a direct result-door send. Task runs,
+   * unknown destinations and empty bodies keep their existing result-door
+   * handling, none of which delivers content. Requires `turnStartSeq`, the
+   * outbound seq at the turn boundary: a result block is a repeat only if
+   * this exact message was written since then.
    */
-  suppressDelivery?: boolean;
-  /**
-   * Did anything user-visible go out this turn? True when the mid-turn door
-   * delivered (midTurnSent > 0) OR any chat row landed in outbound.db since
-   * the turn boundary (covers MCP send_message calls the frame-local count
-   * cannot see). Only meaningful with `suppressDelivery`. When false and the
-   * result carries content — wrapped blocks or unwrapped prose — the turn
-   * counts as undelivered and the wrap-nudge fires, so the model re-sends
-   * and the retry streams through the mid-turn door. This is the deliberate
-   * degradation path for streaming-door misses (SDK drift, a destination
-   * appearing only after streaming, a block that never closed): nudge and
-   * retry, never a direct result-door send.
-   */
-  turnDelivered?: boolean;
 }
 /**
  * `<internal>…</internal>` spans are explicitly not-for-delivery scratchpad.
@@ -937,16 +919,19 @@ const INTERNAL_SPAN_RE = /<internal\b[\s\S]*?<\/internal>/gi;
  */
 export interface MidTurnScanResult {
   delivered: number;
+  /** Delivered blocks that count as the reply (see answersBatch). */
+  replied: number;
   tail: string;
 }
 
-export function deliverMidTurnBlocks(
+export async function deliverMidTurnBlocks(
   text: string,
   routing: RoutingContext,
   turnStartSeq?: number,
   carry = '',
-): MidTurnScanResult {
-  if (routing.taskRun) return { delivered: 0, tail: '' };
+  nudgedWindow?: SeqWindow,
+): Promise<MidTurnScanResult> {
+  if (routing.taskRun) return { delivered: 0, replied: 0, tail: '' };
   const input = carry + text;
   const tailStart = unresolvedTailStart(input);
   const settled = input.slice(0, tailStart);
@@ -964,6 +949,7 @@ export function deliverMidTurnBlocks(
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
   let match: RegExpExecArray | null;
   let delivered = 0;
+  let replied = 0;
   while ((match = MESSAGE_RE.exec(visible)) !== null) {
     const toName = match[1];
     const rawBody = match[2];
@@ -989,11 +975,27 @@ export function deliverMidTurnBlocks(
       log(`Mid-turn <message to="${toName}"> is a verbatim repeat of a message already sent this turn — skipped`);
       continue;
     }
-    sendToDestination(dest, body, routing);
+    if (wasWrittenInWindow(dest, body, nudgedWindow)) {
+      log(`Mid-turn <message to="${toName}"> repeats a message the nudged turn already sent — skipped`);
+      continue;
+    }
+    await sendToDestination(dest, body, routing);
     delivered++;
+    if (answersBatch(dest, routing)) replied++;
     log(`Mid-turn delivery: <message to="${toName}"> (${body.length} chars)`);
   }
-  return { delivered, tail };
+  return { delivered, replied, tail };
+}
+
+/**
+ * Does a block sent to `dest` count as the reply? Not when it goes to another
+ * agent: that may be delegation, so unwrapped text after it still gets the
+ * nudge. The exception is a block back to the agent whose message woke this
+ * turn: that is the reply it is waiting for.
+ */
+function answersBatch(dest: DestinationEntry, routing: RoutingContext): boolean {
+  if (dest.type !== 'agent') return true;
+  return routing.channelType === 'agent' && routing.platformId === dest.agentGroupId;
 }
 
 const OPEN_INTERNAL_RE = /<internal\b/i;
@@ -1050,38 +1052,93 @@ function trailingTagPrefixStart(masked: string): number {
 
 /** Current outbound seq high-water mark (0 when the table is empty). */
 function maxOutboundSeq(): number {
-  return (getOutboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_out').get() as { m: number }).m;
+  return getUndeliveredMessages().reduce((max, message) => Math.max(max, message.seq ?? 0), 0);
 }
 
+/** Outbound seq window (after, upto]. */
+type SeqWindow = { after: number; upto: number };
+
 /**
- * Has ANY chat row the CONTAINER wrote landed in outbound.db after `afterSeq`?
- * Feeds the result door's nudge decision: unlike the frame-local midTurnSent
- * count, this also sees MCP send_message / send_file deliveries made this turn,
- * so an agent that already replied via tools is not nudged into repeating
- * itself. Fail-open to false: if the lookup breaks, the nudge may fire
- * spuriously (a repeat coax), never silently swallow an undelivered turn.
- *
- * `seq % 2 = 1` is load-bearing: the question is "did the AGENT deliver
- * anything this turn?", and the seq-parity invariant reserves odd seq for
- * container writes / even for host writes (see db/messages-out.ts:99). The
- * host injects even-seq `kind='chat'` rows for out-of-band feedback — notably
- * the interim "still working" nudge (src/delivery.ts), which lands in THIS
- * outbound.db past turnStartSeq on any turn slow enough (>30s) to trigger it.
- * Counting that host row would flip turnDelivered to a false `true`, so the
- * result door suppresses the agent's real answer as a "repeat" and skips the
- * wrap-nudge — the reply is silently dropped and the model, whose SDK history
- * still shows it answered, confabulates "I already got back to you."
+ * Chat rows written to outbound.db in the seq window (afterSeq, uptoSeq]:
+ * door, tool and error sends alike. Every caller fails toward a nudge or a
+ * delivery, so a lookup error returns none.
  */
-function chatRowWrittenSince(afterSeq: number): boolean {
+function chatRowsInWindow(afterSeq: number, uptoSeq = Infinity): MessageOutRow[] {
   try {
-    const row = getOutboundDb()
-      .prepare("SELECT 1 AS hit FROM messages_out WHERE seq > ? AND seq % 2 = 1 AND kind = 'chat' LIMIT 1")
-      .get(afterSeq);
-    return row !== undefined && row !== null;
+    // ponytail: reuse the existing semantic read; add a cursor operation only if history scans show up in profiles.
+    return getUndeliveredMessages().filter(
+      (message) => (message.seq ?? 0) > afterSeq && (message.seq ?? 0) <= uptoSeq && message.kind === 'chat',
+    );
   } catch (err) {
-    log(`chatRowWrittenSince failed: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
+    log(`Outbound lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
   }
+}
+
+const INFORMED_NUDGE_QUOTE_MAX = 200;
+const INFORMED_NUDGE_ROWS_MAX = 3;
+
+/**
+ * Wrap-nudge after tool sends plus an unwrapped final text. The rows can't
+ * tell an "on it" from the full reply, so show the model both and let it
+ * answer `<internal>done</internal>` or send only what is missing. Quoting
+ * the final text also ties a retry queued behind a follow-up to its turn.
+ */
+export function buildInformedWrapNudge(
+  rows: MessageOutRow[],
+  finalText: string,
+  destinations: DestinationEntry[],
+): string {
+  const names = destinations.map((d) => d.name).join(', ');
+  // Name where each send went, so a reply sent to the wrong place is not taken as done.
+  const destinationOf = (row: MessageOutRow): string =>
+    destinations.find((d) =>
+      d.type === 'agent'
+        ? row.channel_type === 'agent' && row.platform_id === d.agentGroupId
+        : row.channel_type === d.channelType && row.platform_id === d.platformId,
+    )?.name ?? 'unknown';
+  const clip = (text: string): string => escapePromptXml(clipCodePoints(text, INFORMED_NUDGE_QUOTE_MAX));
+  const sent = rows.slice(0, INFORMED_NUDGE_ROWS_MAX).map((row) => {
+    let text = '';
+    try {
+      const content = JSON.parse(row.content) as {
+        text?: unknown;
+        files?: unknown;
+        operation?: unknown;
+        emoji?: unknown;
+      };
+      const files = Array.isArray(content.files) ? `[file: ${content.files.join(', ')}]` : '';
+      // A reaction is quoted as one, so the model can tell it from a reply.
+      text =
+        content.operation === 'reaction'
+          ? `[reaction: ${typeof content.emoji === 'string' ? content.emoji : '?'}]`
+          : [typeof content.text === 'string' ? content.text : '', files].filter(Boolean).join(' ');
+    } catch {
+      // Unparseable row: quote a placeholder.
+    }
+    return `<sent_message to="${escapePromptXml(destinationOf(row))}">${clip(text || '[non-text message]')}</sent_message>`;
+  });
+  if (rows.length > INFORMED_NUDGE_ROWS_MAX) sent.push(`(+${rows.length - INFORMED_NUDGE_ROWS_MAX} more)`);
+  return (
+    `<system>Your final text was not delivered — it was not wrapped in <message to="name">...</message> blocks:\n` +
+    `<undelivered_text>${clip(finalText)}</undelivered_text>\n` +
+    `Earlier in that turn you already sent:\n${sent.join('\n')}\n` +
+    `If what was sent is the full reply, to where it was owed, respond with only <internal>done</internal> and nothing more will be sent. ` +
+    `Otherwise send only what is still missing, wrapped in <message to="name">...</message>, without repeating what already went out. ` +
+    `Your destinations: ${escapePromptXml(names)}.</system>`
+  );
+}
+
+/** First `max` code points of `text`, with an ellipsis when cut. Never splits a surrogate pair. */
+function clipCodePoints(text: string, max: number): string {
+  let end = 0;
+  let count = 0;
+  for (const char of text) {
+    if (count === max) return `${text.slice(0, end)}…`;
+    end += char.length;
+    count++;
+  }
+  return text;
 }
 
 /**
@@ -1094,32 +1151,41 @@ function chatRowWrittenSince(afterSeq: number): boolean {
  */
 function wasWrittenInSeqWindow(dest: DestinationEntry, body: string, afterSeq: number, uptoSeq: number): boolean {
   if (uptoSeq <= afterSeq) return false;
-  try {
-    const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
-    const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-    const row = getOutboundDb()
-      .prepare(
-        `SELECT 1 AS hit FROM messages_out
-         WHERE seq > ? AND seq <= ? AND kind = 'chat'
-           AND platform_id = ? AND channel_type = ? AND content = ?
-         LIMIT 1`,
-      )
-      .get(afterSeq, uptoSeq, platformId, channelType, JSON.stringify({ text: body }));
-    return row !== undefined && row !== null;
-  } catch (err) {
-    // The guard is an anti-duplication refinement; if the lookup itself
-    // fails, fall through to delivery (the write will surface any real DB
-    // breakage loudly).
-    log(`Echo-guard lookup failed: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
-  }
+  const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
+  const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  const content = JSON.stringify({ text: body });
+  // A lookup error reads as "not written": the guard falls through to
+  // delivery, and the write surfaces any real DB breakage loudly.
+  return chatRowsInWindow(afterSeq, uptoSeq).some(
+    (message) =>
+      message.platform_id === platformId && message.channel_type === channelType && message.content === content,
+  );
 }
 
-export function dispatchResultText(
+/**
+ * Did the nudged turn already send this body to this destination? Compares
+ * trimmed text, since a tool send keeps the whitespace a block loses.
+ */
+function wasWrittenInWindow(dest: DestinationEntry, body: string, window: SeqWindow | undefined): boolean {
+  if (!window) return false;
+  const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
+  const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  return chatRowsInWindow(window.after, window.upto).some((message) => {
+    if (message.platform_id !== platformId || message.channel_type !== channelType) return false;
+    try {
+      const content = JSON.parse(message.content) as { text?: unknown; operation?: unknown };
+      return content.operation === undefined && typeof content.text === 'string' && content.text.trim() === body;
+    } catch {
+      return false;
+    }
+  });
+}
+
+export async function dispatchResultText(
   text: string,
   routing: RoutingContext,
   options?: ResultDispatchOptions,
-): { sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[]; resultBlocks: number } {
+): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[]; undelivered: string }> {
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1134,10 +1200,10 @@ export function dispatchResultText(
   // text with no (new) blocks after a mid-turn delivery is scratchpad, not an
   // undelivered reply.
   let sent = options?.midTurnSent ?? 0;
-  // <message> blocks present in THIS result text (delivered, stripped, task
-  // or dropped alike) — drives the bare-error-text delivery gate, which must
-  // key on the error result itself, not on earlier mid-turn deliveries.
-  let resultBlocks = 0;
+  let replied = options?.midTurnReplied ?? sent;
+  // Result blocks that were not delivered (unknown destination, or missed by
+  // the stream): always nudge, even when another block went out this turn.
+  let missed = 0;
   // <message to> blocks left inert in a task run — drives the same-turn
   // "use send_message" nudge in processQuery.
   const taskBlocks: TaskMessageBlock[] = [];
@@ -1151,7 +1217,6 @@ export function dispatchResultText(
     const toName = match[1];
     const body = stripHarnessTagArtifacts(match[2].trim());
     lastIndex = MESSAGE_RE.lastIndex;
-    resultBlocks++;
 
     // One-door delivery in task sessions: only the send_message tool delivers.
     // A final-text <message to> block here is either an echo of a tool send the
@@ -1169,6 +1234,9 @@ export function dispatchResultText(
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
+      // Possibly lost: always nudge. If it already went out before its destination
+      // was removed, the informed nudge quotes that send and the model answers done.
+      missed++;
       continue;
     }
     // Never deliver a blank message: a body that is empty (or was only
@@ -1179,24 +1247,34 @@ export function dispatchResultText(
       scratchpadParts.push(`[not delivered — empty after sanitization; to="${toName}"]`);
       continue;
     }
-    // One content door: with an emitsMidTurnText provider the result door
+    // One content door: with a mid-turn delivery provider the result door
     // never sends. A deliverable block here is either a repeat of a mid-turn
-    // delivery (turnDelivered — keep it out of the scratchpad so it does not
-    // read as an undelivered reply) or content the streaming door missed —
-    // then it goes to the scratchpad as undelivered content, which makes the
-    // turn count as undelivered and fires the wrap-nudge: the model re-sends
-    // and the retry streams through the mid-turn door.
+    // delivery (keep it out of the scratchpad so it does not read as an
+    // undelivered reply) or content the streaming door missed — then it goes
+    // to the scratchpad as undelivered content, which makes the turn count as
+    // undelivered and fires the wrap-nudge: the model re-sends and the retry
+    // streams through the mid-turn door.
     if (options?.suppressDelivery) {
-      if (options.turnDelivered) {
+      // Exact match, so a streamed delegation can't hide an unstreamed answer.
+      const repeat =
+        wasWrittenInWindow(dest, body, options.nudgedWindow) ||
+        wasWrittenInSeqWindow(dest, body, options.turnStartSeq, maxOutboundSeq());
+      if (repeat) {
         log(`<message to="${toName}"> in final result after a same-turn delivery — repeat, result door does not send`);
       } else {
-        log(`<message to="${toName}"> in final result but nothing was delivered this turn — nudging for a mid-turn resend`);
+        log(`<message to="${toName}"> in final result was not delivered this turn — nudging for a mid-turn resend`);
         scratchpadParts.push(`[not delivered — the result door does not send; to="${toName}"] ${body}`);
+        missed++;
       }
       continue;
     }
-    sendToDestination(dest, body, routing);
+    if (wasWrittenInWindow(dest, body, options?.nudgedWindow)) {
+      log(`<message to="${toName}"> repeats a message the nudged turn already sent — not sent again`);
+      continue;
+    }
+    await sendToDestination(dest, body, routing);
     sent++;
+    if (answersBatch(dest, routing)) replied++;
   }
   if (lastIndex < text.length) {
     scratchpadParts.push(text.slice(lastIndex));
@@ -1210,15 +1288,15 @@ export function dispatchResultText(
 
   // In a task run, plain final text is the NORMAL ending (it becomes the run
   // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
-  // With suppressDelivery the delivered-this-turn question is answered by
-  // turnDelivered (door deliveries + DB-visible sends like MCP send_message);
-  // otherwise by this dispatch's own send count.
-  const anythingDelivered = options?.suppressDelivery ? options.turnDelivered === true : sent > 0;
-  const hasUnwrapped = !routing.taskRun && !anythingDelivered && !!scratchpad;
+  const hasUnwrapped = !routing.taskRun && (missed > 0 || (replied === 0 && !!scratchpad));
   if (hasUnwrapped) {
-    log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
+    log(
+      replied > 0
+        ? `WARNING: a <message to="..."> block in the final text was not delivered`
+        : `WARNING: agent output had no <message to="..."> blocks — nothing was sent`,
+    );
   }
-  return { sent, hasUnwrapped, taskBlocks, resultBlocks };
+  return { sent, hasUnwrapped, taskBlocks, undelivered: scratchpad };
 }
 
 /**
@@ -1261,7 +1339,7 @@ function escapePromptXml(value: string): string {
  * `task_log` outbound row; the host appends it to the series' tasks/<id>.md
  * with its usual timestamp stamp. Never delivered to anyone.
  */
-export function autoAppendTaskLog(text: string): void {
+export async function autoAppendTaskLog(text: string): Promise<void> {
   // Run-log hygiene: an inert <message to> block never belongs in the log as
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
@@ -1271,7 +1349,7 @@ export function autoAppendTaskLog(text: string): void {
   );
   const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!line) return;
-  writeMessageOut({
+  await writeMessageOut({
     id: generateId(),
     kind: 'task_log',
     content: JSON.stringify({ text: line }),
@@ -1279,15 +1357,16 @@ export function autoAppendTaskLog(text: string): void {
   log('Task run log auto-appended from final text');
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Resolve thread_id per-destination from the most recent inbound message
-  // that came from this same channel+platform. In agent-shared sessions,
-  // different destinations have different thread contexts — using a single
-  // routing.threadId would stamp one channel's thread onto another.
-  const destRouting = resolveDestinationThread(channelType, platformId);
-  writeMessageOut({
+  // Thread per destination: the batch's own thread when the destination is the
+  // channel being answered, else that channel's latest inbound thread. In
+  // agent-shared sessions different destinations have different thread
+  // contexts — stamping routing.threadId on every send would put one channel's
+  // thread onto another.
+  const destRouting = resolveDestinationThread(channelType, platformId, routing);
+  await writeMessageOut({
     id: generateId(),
     in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
     kind: 'chat',
@@ -1298,28 +1377,18 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   });
 }
 
-/**
- * Find the thread_id and message id from the most recent inbound message
- * matching the given channel+platform. Returns null if no match found.
- */
-function resolveDestinationThread(
-  channelType: string,
-  platformId: string,
-): { threadId: string | null; inReplyTo: string | null } | null {
-  try {
-    const db = getInboundDb();
-    const row = db
-      .prepare(
-        `SELECT thread_id, id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ?
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined;
-    if (row) return { threadId: row.thread_id, inReplyTo: row.id };
-  } catch (err) {
-    log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return null;
+/** Publish `routing` as the reply stamp the MCP tools read (null route clears it). */
+function publishReplyRoute(routing: RoutingContext): void {
+  setCurrentReplyRoute(
+    routing.inReplyTo
+      ? {
+          inReplyTo: routing.inReplyTo,
+          channelType: routing.channelType,
+          platformId: routing.platformId,
+          threadId: routing.threadId,
+        }
+      : null,
+  );
 }
 
 function sleep(ms: number): Promise<void> {

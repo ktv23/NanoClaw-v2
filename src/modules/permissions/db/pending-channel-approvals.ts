@@ -25,10 +25,9 @@ export interface PendingChannelApproval {
   options_json: string;
 }
 
-export function createPendingChannelApproval(row: PendingChannelApproval): void {
-  getDb()
-    .prepare(
-      `INSERT INTO pending_channel_approvals (
+export async function createPendingChannelApproval(row: PendingChannelApproval): Promise<void> {
+  await getDb().run(
+    `INSERT INTO pending_channel_approvals (
          messaging_group_id, agent_group_id, original_message,
          approver_user_id, created_at, title, question, options_json
        )
@@ -36,36 +35,48 @@ export function createPendingChannelApproval(row: PendingChannelApproval): void 
          @messaging_group_id, @agent_group_id, @original_message,
          @approver_user_id, @created_at, @title, @question, @options_json
        )`,
-    )
-    .run(row);
+    row,
+  );
 }
 
-export function getPendingChannelApproval(messagingGroupId: string): PendingChannelApproval | undefined {
-  return getDb()
-    .prepare('SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?')
-    .get(messagingGroupId) as PendingChannelApproval | undefined;
+export async function getPendingChannelApproval(messagingGroupId: string): Promise<PendingChannelApproval | undefined> {
+  return getDb().get<PendingChannelApproval>(
+    'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
+    messagingGroupId,
+  );
 }
 
-export function hasInFlightChannelApproval(messagingGroupId: string): boolean {
-  const row = getDb()
-    .prepare('SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?')
-    .get(messagingGroupId) as { x: number } | undefined;
+export async function hasInFlightChannelApproval(messagingGroupId: string): Promise<boolean> {
+  const row = await getDb().get<{ x: number }>(
+    'SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?',
+    messagingGroupId,
+  );
   return row !== undefined;
 }
 
-export function updatePendingChannelApprovalCard(
+/** False when that request (`createdAt`) is gone: decided, or replaced by a newer one. */
+export async function updatePendingChannelApprovalCard(
   messagingGroupId: string,
+  createdAt: string,
   title: string,
   question: string,
   optionsJson: string,
-): void {
-  getDb()
-    .prepare(
-      'UPDATE pending_channel_approvals SET title = ?, question = ?, options_json = ? WHERE messaging_group_id = ?',
-    )
-    .run(title, question, optionsJson, messagingGroupId);
+): Promise<boolean> {
+  const result = await getDb().run(
+    'UPDATE pending_channel_approvals SET title = ?, question = ?, options_json = ? WHERE messaging_group_id = ? AND created_at = ?',
+    title,
+    question,
+    optionsJson,
+    messagingGroupId,
+    createdAt,
+  );
+  return result.changes > 0;
 }
 
-export function deletePendingChannelApproval(messagingGroupId: string): void {
-  getDb().prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?').run(messagingGroupId);
+/** False when the row was already gone (another response took it). */
+export async function deletePendingChannelApproval(messagingGroupId: string): Promise<boolean> {
+  return (
+    (await getDb().run('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?', messagingGroupId))
+      .changes > 0
+  );
 }
