@@ -27,3 +27,12 @@ export function skillEnforcesLockdown(skillDir: string): boolean {
 export function withoutLockdownSkills(sharedSkillsDir: string, names: string[]): string[] {
   return names.filter((name) => !skillEnforcesLockdown(path.join(sharedSkillsDir, name)));
 }
+
+/**
+ * True when a group's skill selection includes a lockdown skill. `'all'` never
+ * does: see `withoutLockdownSkills`.
+ */
+export function selectsLockdownSkill(skills: string[] | 'all', sharedSkillsDir: string): boolean {
+  if (skills === 'all') return false;
+  return skills.some((name) => skillEnforcesLockdown(path.join(sharedSkillsDir, name)));
+}

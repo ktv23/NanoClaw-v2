@@ -13,7 +13,7 @@ import { getUndeliveredMessages } from '../db/messages-out.js';
 import { extractRouting, formatMessages } from '../formatter.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
 import { gateLookupTurn, loadGate, promptHasAllowedTrigger, resetGateForTest } from './gate.js';
-import { setCurrentTurn } from './trigger-match.js';
+import { currentTurnText, setCurrentTurn } from './trigger-match.js';
 
 // currentTurnText reads a module-global "current turn" the poll loop publishes.
 // Other suites (poll-loop) set it and don't clear it; reset before each test so
@@ -195,6 +195,22 @@ describe('gateLookupTurn (real session mailbox)', () => {
 
     expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('keeps a game question as the current turn when a host notice lands in the same batch', async () => {
+    resetGateForTest(dir);
+    insert('m1', 'chat', { sender: 'Kin', text: 'mtg what does Liliana do?' }, 1);
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
+         VALUES ('n1', 'chat', datetime('now'), 'pending', 1, 'ag-1', 'agent', ?)`,
+      )
+      .run(JSON.stringify({ sender: 'system', senderId: 'system', text: 'Your last reply could NOT be delivered.' }));
+    const batch = getPendingMessages();
+
+    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
+    // The directive hook reads this: it must see the question, not the notice.
+    expect(currentTurnText('ignored')).toContain('mtg what does Liliana do?');
   });
 
   it('does nothing when the group selected no enforcing skill', async () => {

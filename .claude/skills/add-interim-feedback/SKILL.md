@@ -24,13 +24,13 @@ cp $S/*.ts src/modules/interim-feedback/
 
 ### 2. Load it from the modules barrel
 
-Append to `src/modules/index.ts`:
+In `src/modules/index.ts`, add the import on its own line directly before `import './community-portal/index.js';`:
 
 ```ts
 import './interim-feedback/index.js';
 ```
 
-Skip if `grep -q interim-feedback src/modules/index.ts` already matches. It must come after `./approvals/index.js`, which it uses to reach the agent's session.
+Skip if `grep -q interim-feedback src/modules/index.ts` already matches. The position matters twice over: it must come after `./approvals/index.js`, which it uses to reach the agent's session, and before the community portal, whose registration test expects the portal to be the last module that registers with the host lifecycle.
 
 ### 3. Report a given-up reply
 

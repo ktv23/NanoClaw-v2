@@ -24,6 +24,6 @@ import './interactive/index.js';
 import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
+import './interim-feedback/index.js';
 import './community-portal/index.js';
 import './discord-thread-titles/index.js';
-import './interim-feedback/index.js';

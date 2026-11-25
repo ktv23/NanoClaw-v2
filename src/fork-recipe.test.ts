@@ -37,7 +37,6 @@ const COPY_SETS: CopySet[] = [
   { skill: 'add-mnemon', from: '.', to: 'src' },
   { skill: 'add-lookup-helpers', from: 'container', to: 'container/agent-runner/src/lookup-helpers' },
   { skill: 'add-lookup-helpers', from: 'host', to: 'src' },
-  { skill: 'add-origin-scoped-destinations', from: '.', to: 'src/modules/agent-to-agent' },
   { skill: 'add-host-gateway-noproxy', from: '.', to: 'src' },
   { skill: 'add-config-skills-verbs', from: '.', to: 'src/cli/resources' },
   { skill: 'add-discord-thread-titles', from: '.', to: 'src/modules/discord-thread-titles' },
@@ -71,13 +70,19 @@ describe('installed skill files match their source', () => {
 describe('skills that share a file keep their place', () => {
   const read = (file: string) => fs.readFileSync(path.join(root, file), 'utf8');
 
-  it('the modules barrel loads the fork modules after approvals', () => {
+  it('the modules barrel loads the fork modules in a workable order', () => {
     const barrel = read('src/modules/index.ts');
     const at = (line: string) => barrel.indexOf(line);
+    const approvals = at("import './approvals/index.js';");
+    const interim = at("import './interim-feedback/index.js';");
+    const portal = at("import './community-portal/index.js';");
     expect(at("import './discord-thread-titles/index.js';")).toBeGreaterThan(-1);
-    // interim-feedback reaches the agent's session through the approvals module.
-    expect(at("import './interim-feedback/index.js';")).toBeGreaterThan(at("import './approvals/index.js';"));
-    expect(at("import './approvals/index.js';")).toBeGreaterThan(-1);
+    expect(approvals).toBeGreaterThan(-1);
+    // interim-feedback reaches the agent's session through the approvals module...
+    expect(interim).toBeGreaterThan(approvals);
+    // ...and stays ahead of the community portal, whose own registration test
+    // expects the portal to be the last module on the host lifecycle.
+    if (portal > -1) expect(interim).toBeLessThan(portal);
   });
 
   it('container-runner.ts carries both of its reach-ins', () => {

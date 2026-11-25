@@ -96,18 +96,6 @@ export function resetGateForTest(dir?: string): void {
 }
 
 /**
- * Publish the current turn for trigger detection: the block of the newest wake
- * (trigger=1) message in the batch. The gate and the directive hook both read
- * it through trigger-match.currentTurnText, so they classify the message that
- * engaged the turn rather than whatever context row sorts last. A batch with no
- * wake row (task, system) clears it, restoring the last-block fallback.
- */
-function publishCurrentTurn(batch: MessageInRow[]): void {
-  const wakeRows = batch.filter((m) => m.trigger === 1);
-  setCurrentTurn(wakeRows.length > 0 ? formatMessages([wakeRows[wakeRows.length - 1]]) : null);
-}
-
-/**
  * A chat message from a person on a platform. Chat rows the host or another
  * agent addressed to this agent (channel `agent`: an approval result, a
  * delivery-failure notice) and session echoes are not something a person
@@ -116,6 +104,24 @@ function publishCurrentTurn(batch: MessageInRow[]): void {
 function isUserChat(m: MessageInRow): boolean {
   if (m.kind !== 'chat' && m.kind !== 'chat-sdk') return false;
   return m.channel_type !== 'agent' && m.channel_type !== 'session-echo';
+}
+
+/**
+ * Publish the current turn for trigger detection: the block of the newest wake
+ * (trigger=1) message in the batch. The gate and the directive hook both read
+ * it through trigger-match.currentTurnText, so they classify the message that
+ * engaged the turn rather than whatever context row sorts last.
+ *
+ * A person's message wins over a notice addressed to the agent: when a game
+ * question and a host notice land in one batch, the question is the turn, and
+ * its directive must still be injected. A batch with no wake row (task,
+ * system) clears the override, restoring the last-block fallback.
+ */
+function publishCurrentTurn(batch: MessageInRow[]): void {
+  const wakeRows = batch.filter((m) => m.trigger === 1);
+  const fromPeople = wakeRows.filter(isUserChat);
+  const turn = (fromPeople.length > 0 ? fromPeople : wakeRows).at(-1);
+  setCurrentTurn(turn ? formatMessages([turn]) : null);
 }
 
 /**

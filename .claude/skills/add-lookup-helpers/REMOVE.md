@@ -28,11 +28,23 @@ and restore the selection in `selectedSkillNames` to:
   const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
 ```
 
+In `src/modules/agent-to-agent/write-destinations.ts`, delete the import line:
+
+```ts
+import { scopeToSessionOrigin } from '../../lookup-origin-scope.js';
+```
+
+and restore the first line of `writeDestinations` to:
+
+```ts
+  const rows = await getDestinations(agentGroupId);
+```
+
 ## 2. Remove the copied files
 
 ```bash
 rm -rf container/agent-runner/src/lookup-helpers
-rm -f src/lookup-lockdown.ts src/lookup-lockdown.test.ts
+rm -f src/lookup-lockdown.ts src/lookup-lockdown.test.ts src/lookup-origin-scope.ts src/lookup-origin-scope.test.ts
 ```
 
 ## 3. Build and restart

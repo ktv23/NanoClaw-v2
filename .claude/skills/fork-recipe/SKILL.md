@@ -15,15 +15,14 @@ This fork is upstream NanoClaw plus the skills below, applied in this order. Not
 | 2 | `add-telegram` | upstream | Telegram channel | — |
 | 3 | `add-discord` | upstream | Discord channel | — |
 | 4 | `add-mnemon` | upstream | Graph memory in the agent image | — |
-| 5 | `add-lookup-helpers` | this fork | `helper.json` directives and the lookup gate for reference bots | — |
-| 6 | `add-origin-scoped-destinations` | this fork | Replies stay in the channel that asked | — |
-| 7 | `add-host-gateway-noproxy` | this fork | `host.docker.internal` bypasses the gateway proxy | — |
-| 8 | `add-config-skills-verbs` | this fork | `ncl groups config set-skills / add-skill / remove-skill` | — |
-| 9 | `add-discord-thread-titles` | this fork | Discord threads named after the question | 3 |
-| 10 | `add-google-mcp-tools` | this fork | Gmail and Calendar MCP servers in the agent image | 1 |
-| 11 | `add-interim-feedback` | this fork | "Still working" note and delivery-failure notice | — |
+| 5 | `add-lookup-helpers` | this fork | `helper.json` directives, the lookup gate, and locked-down bots that answer only where asked | — |
+| 6 | `add-host-gateway-noproxy` | this fork | `host.docker.internal` bypasses the gateway proxy | — |
+| 7 | `add-config-skills-verbs` | this fork | `ncl groups config set-skills / add-skill / remove-skill` | — |
+| 8 | `add-discord-thread-titles` | this fork | Discord threads named after the question | 3 |
+| 9 | `add-google-mcp-tools` | this fork | Gmail and Calendar MCP servers in the agent image | 1 |
+| 10 | `add-interim-feedback` | this fork | "Still working" note and delivery-failure notice | — |
 
-Skills 5 and 7 both reach into `src/container-runner.ts`, at different functions. Skills 9 and 11 both append a line to `src/modules/index.ts`. Skill 11 is last on purpose: it is the one most likely to need rework when upstream changes delivery, and it can be removed without touching the others.
+Skills 5 and 6 both reach into `src/container-runner.ts`, at different functions. Skills 8 and 10 both add a line to `src/modules/index.ts`. Skill 10 is last on purpose: it is the one most likely to need rework when upstream changes delivery, and it can be removed without touching the others.
 
 ## What is not in the recipe
 
@@ -45,7 +44,7 @@ The rare path, for when the fork has fallen far behind or is being handed to som
 
 1. Start a branch at the upstream release tag.
 2. Copy this fork's skill folders into `.claude/skills/`: `fork-recipe` and every skill marked "this fork" above.
-3. Apply skills 1–11 in order, following each skill's `SKILL.md`. Each is safe to re-run.
+3. Apply skills 1–10 in order, following each skill's `SKILL.md`. Each is safe to re-run.
 4. Copy the stack test and run everything:
 
    ```bash
