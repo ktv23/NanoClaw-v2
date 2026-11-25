@@ -63,15 +63,22 @@ export async function nameSpawnedDiscordThread(event: SessionCreatedEvent): Prom
   const url = `${DISCORD_API}/channels/${threadSnowflake}`;
   try {
     const current = await fetch(url, { headers: { Authorization: `Bot ${token}` } });
-    if (!current.ok) return;
+    if (!current.ok) {
+      log.warn('Discord thread rename failed', { threadId: event.threadId, step: 'lookup', status: current.status });
+      return;
+    }
     const channel = (await current.json()) as { name?: string };
     if (!channel.name || !/^Thread\b/i.test(channel.name)) return;
 
-    await fetch(url, {
+    const renamed = await fetch(url, {
       method: 'PATCH',
       headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: title }),
     });
+    // fetch resolves on a 403 or a 429: a rename Discord refused is not an exception.
+    if (!renamed.ok) {
+      log.warn('Discord thread rename failed', { threadId: event.threadId, step: 'rename', status: renamed.status });
+    }
   } catch (err) {
     log.warn('Discord thread rename failed', { threadId: event.threadId, err });
   }

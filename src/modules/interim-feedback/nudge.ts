@@ -9,6 +9,13 @@
  * "Still working" is read from the session mailbox: the container holds a
  * processing claim from the moment it picks a batch up until it finishes the
  * turn. That needs nothing from the container beyond what it already records.
+ * The claim has to have been taken around the time the message arrived: an
+ * old message nobody answered does not become "being worked on" because some
+ * later, unrelated turn is open.
+ *
+ * Known limits, from what the mailbox history exposes (kind, time, content):
+ * a message from another agent looks like a person's, and a message the agent
+ * sent to another agent looks like a reply to the person.
  *
  * The note goes straight out through the channel adapter. It is never written
  * to the session's outbound mailbox, which belongs to the container and is
@@ -16,7 +23,7 @@
  *
  * This file holds the logic and registers nothing; ./index.ts starts it.
  */
-import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getMessagingGroup, getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
 import { getRunningSessions, isTaskThread } from '../../db/sessions.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
@@ -30,12 +37,21 @@ export const INTERIM_FEEDBACK_MS = 30_000;
 export const INTERIM_MAX_AGE_MS = 10 * 60_000;
 export const INTERIM_TEXT = "⏳ Still on it — this one's taking a bit, hang tight.";
 
+/**
+ * How long after a message arrives its claim may be taken and still count as
+ * "for that message": covers a cold container start, with room to spare.
+ */
+export const CLAIM_WINDOW_MS = 90_000;
+/** Slack for a platform timestamp that runs slightly ahead of this host's clock. */
+const CLOCK_SKEW_MS = 5_000;
+
 const CHECK_INTERVAL_MS = 5_000;
 const HISTORY_DEPTH = 20;
 
-/** What the mailbox says about a session's current turn. Newest rows first. */
+/** What the mailbox says about a session's current turn. History is newest first. */
 export interface TurnView {
-  openClaims: number;
+  /** When each still-open processing claim was taken (ISO timestamps). */
+  openClaimTimes: string[];
   inbound: MailboxHistoryMessage[];
   outbound: MailboxHistoryMessage[];
 }
@@ -68,7 +84,7 @@ export function shouldNudge(
   alreadyNudgedFor: string | undefined,
   now: number,
 ): { nudge: boolean; turnKey?: string } {
-  if (view.openClaims === 0) return { nudge: false };
+  if (view.openClaimTimes.length === 0) return { nudge: false };
 
   const asked = newestUserChat(view.inbound);
   if (!asked) return { nudge: false };
@@ -77,6 +93,13 @@ export function shouldNudge(
 
   const waited = now - askedAt;
   if (waited < INTERIM_FEEDBACK_MS || waited > INTERIM_MAX_AGE_MS) return { nudge: false };
+
+  // The open turn has to be the one this message started.
+  const claimedForIt = view.openClaimTimes.some((taken) => {
+    const takenAt = Date.parse(taken);
+    return takenAt >= askedAt - CLOCK_SKEW_MS && takenAt <= askedAt + CLAIM_WINDOW_MS;
+  });
+  if (!claimedForIt) return { nudge: false };
 
   const turnKey = asked.timestamp;
   if (alreadyNudgedFor === turnKey) return { nudge: false, turnKey };
@@ -98,7 +121,7 @@ async function checkSession(session: Session, adapter: ChannelDeliveryAdapter, n
   if (!session.messaging_group_id || isTaskThread(session.thread_id)) return;
 
   const view = await withExistingMailboxSession(session.agent_group_id, session.id, (mailbox) => ({
-    openClaims: mailbox.getProcessingClaims().length,
+    openClaimTimes: mailbox.getProcessingClaims().map((claim) => claim.statusChanged),
     inbound: mailbox.getInboundHistory(HISTORY_DEPTH),
     outbound: mailbox.getOutboundHistory(HISTORY_DEPTH),
   }));
@@ -107,9 +130,16 @@ async function checkSession(session: Session, adapter: ChannelDeliveryAdapter, n
   const decision = shouldNudge(view, nudgedFor.get(session.id), now);
   if (!decision.nudge || !decision.turnKey) return;
 
+  // An agent-shared session serves every chat of its group; the one chat it
+  // is bound to is not necessarily where the slow message came from.
+  const wiring = await getMessagingGroupAgentByPair(session.messaging_group_id, session.agent_group_id);
+  if (wiring?.session_mode === 'agent-shared') return;
+
   const mg = await getMessagingGroup(session.messaging_group_id);
   if (!mg) return;
 
+  // One attempt per message, recorded before the send: a channel that is
+  // failing must not be retried every few seconds for the life of the turn.
   nudgedFor.set(session.id, decision.turnKey);
   try {
     await adapter.deliver(
@@ -123,7 +153,6 @@ async function checkSession(session: Session, adapter: ChannelDeliveryAdapter, n
     );
     log.info('Sent interim "still working" feedback', { sessionId: session.id });
   } catch (err) {
-    nudgedFor.delete(session.id); // let a later tick try again
     log.warn('Interim feedback delivery failed', { sessionId: session.id, err });
   }
 }

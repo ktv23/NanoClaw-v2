@@ -5,6 +5,11 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../log.js', () => ({
+  log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+}));
+
+import { log } from '../../log.js';
 import type { SessionCreatedEvent } from '../../router.js';
 import { deriveThreadTitle, nameSpawnedDiscordThread } from './rename.js';
 
@@ -45,6 +50,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  vi.clearAllMocks();
 });
 
 describe('nameSpawnedDiscordThread', () => {
@@ -78,12 +84,27 @@ describe('nameSpawnedDiscordThread', () => {
   });
 
   it('does not rename when Discord refuses the lookup, and swallows a network error', async () => {
-    fetchMock.mockResolvedValueOnce({ ok: false, json: async () => ({}) });
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404, json: async () => ({}) });
     await nameSpawnedDiscordThread(event({}));
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
     fetchMock.mockRejectedValueOnce(new Error('network down'));
     await expect(nameSpawnedDiscordThread(event({}))).resolves.toBeUndefined();
+  });
+
+  it('logs a rename Discord refuses, since a 403 or 429 is not an exception', async () => {
+    fetchMock.mockImplementation(async (_url: string, init?: { method?: string }) =>
+      init?.method === 'PATCH'
+        ? { ok: false, status: 403, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({ name: 'Thread 8/18/2026, 8:28 AM' }) },
+    );
+
+    await nameSpawnedDiscordThread(event({}));
+
+    expect(log.warn).toHaveBeenCalledWith(
+      'Discord thread rename failed',
+      expect.objectContaining({ step: 'rename', status: 403 }),
+    );
   });
 });
 

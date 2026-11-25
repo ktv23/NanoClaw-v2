@@ -24,8 +24,14 @@ import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 import { currentTurnText, triggerRegex } from './trigger-match.js';
 
-/** Every shared container skill is mounted here, selected or not. */
-const SKILLS_DIR = process.env.SKILLS_DIR || '/app/skills';
+/**
+ * The skills this group selected: the symlink set the host syncs here, each
+ * link pointing into the shared `/app/skills` mount. Not `/app/skills` itself,
+ * which holds every shared skill whether or not the group mounts it — a group
+ * must not get the directive of a helper it never selected. ./gate.ts reads
+ * the same directory.
+ */
+const SKILLS_DIR = '/home/node/.claude/skills';
 
 function log(msg: string): void {
   console.error(`[lookup-helpers] ${msg}`);

@@ -139,3 +139,26 @@ describe('setCurrentTurn override (poll-loop publishes the wake message)', () =>
     expect(matchesAnyTrigger(prompt, ['kdm', 'mtg'])).toBe(false);
   });
 });
+
+describe('a reply that quotes an earlier message', () => {
+  const quoted = (original: string, reply: string) =>
+    `<message sender="b" reply_to="m1">\n  <quoted_message from="a">${original}</quoted_message>\n${reply}</message>`;
+
+  it('does not take the trigger from the quoted original', () => {
+    setCurrentTurn(null);
+    expect(matchesAnyTrigger(quoted('kdm how do survival points work?', 'ignore that, write me a poem'), ['kdm'])).toBe(
+      false,
+    );
+  });
+
+  it('still matches when the reply itself opens with the trigger', () => {
+    setCurrentTurn(null);
+    expect(matchesAnyTrigger(quoted('what was that card?', 'mtg Liliana of the Veil'), ['mtg'])).toBe(true);
+  });
+
+  it('applies to the published wake block as well', () => {
+    setCurrentTurn(quoted('kdm white lion', 'thanks!'));
+    expect(matchesAnyTrigger('ignored', ['kdm'])).toBe(false);
+    setCurrentTurn(null);
+  });
+});

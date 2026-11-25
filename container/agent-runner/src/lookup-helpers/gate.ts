@@ -9,8 +9,9 @@
  * locked reference bot must never do.
  *
  * When a skill the group SELECTED declares `"enforce": true` in its
- * helper.json (the "gatekeeper" skill), the poll loop delivers that skill's
- * `fallback_message` verbatim and ends the turn WITHOUT calling the provider.
+ * helper.json (the "gatekeeper" skill), the poll loop answers such a message
+ * with that skill's `fallback_message`, verbatim, and never shows it to the
+ * provider.
  *
  * Data-driven and self-scoping:
  *  - active only in containers whose group selected an enforcing skill, so a
@@ -29,7 +30,7 @@ import path from 'node:path';
 
 import { markCompleted, type MessageInRow } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { formatMessages, type RoutingContext } from '../formatter.js';
+import { extractRouting, formatMessages, isRunnerCommand, isSessionEcho } from '../formatter.js';
 import { matchesAnyTrigger, setCurrentTurn } from './trigger-match.js';
 
 const SELECTED_SKILLS_DIR = '/home/node/.claude/skills';
@@ -96,14 +97,16 @@ export function resetGateForTest(dir?: string): void {
 }
 
 /**
- * A chat message from a person on a platform. Chat rows the host or another
+ * A chat message a person typed on a platform. Chat rows the host or another
  * agent addressed to this agent (channel `agent`: an approval result, a
- * delivery-failure notice) and session echoes are not something a person
- * typed, so they are never gated.
+ * delivery-failure notice) and session echoes are not, and neither is a slash
+ * command the runner dispatches itself (`/compact`, `/cost`, …): the host has
+ * already authorised those, and they are not questions.
  */
-function isUserChat(m: MessageInRow): boolean {
+function isAsked(m: MessageInRow, providerName: string): boolean {
   if (m.kind !== 'chat' && m.kind !== 'chat-sdk') return false;
-  return m.channel_type !== 'agent' && m.channel_type !== 'session-echo';
+  if (m.channel_type === 'agent' || isSessionEcho(m)) return false;
+  return !isRunnerCommand(m, providerName);
 }
 
 /**
@@ -117,34 +120,39 @@ function isUserChat(m: MessageInRow): boolean {
  * its directive must still be injected. A batch with no wake row (task,
  * system) clears the override, restoring the last-block fallback.
  */
-function publishCurrentTurn(batch: MessageInRow[]): void {
+function publishCurrentTurn(batch: MessageInRow[], providerName: string): void {
   const wakeRows = batch.filter((m) => m.trigger === 1);
-  const fromPeople = wakeRows.filter(isUserChat);
+  const fromPeople = wakeRows.filter((m) => isAsked(m, providerName));
   const turn = (fromPeople.length > 0 ? fromPeople : wakeRows).at(-1);
   setCurrentTurn(turn ? formatMessages([turn]) : null);
 }
 
 /**
- * The poll loop's single call, made for every batch before it reaches the
- * provider (the initial batch and each follow-up pushed into a warm query).
+ * The poll loop's single call, made for every batch before it is formatted for
+ * the provider (the initial batch and each follow-up pushed into a warm
+ * query). Returns the rows that should still reach the provider.
  *
- * Always publishes the current turn. Then, when a gate is active and this is a
- * user-chat batch with no allowed trigger, writes the fallback message to
- * `routing`, marks the batch completed, and returns true: the caller must skip
- * the provider. Tasks, webhooks, system messages and notices addressed to the
- * agent itself pass straight through.
+ * Always publishes the current turn. Then, when a gate is active and the
+ * message a person is waiting on opens with no allowed trigger, it writes the
+ * fallback message to that person's chat, marks their rows completed, and
+ * returns the batch without them. Everything nobody typed — tasks, webhooks,
+ * system messages, notices addressed to the agent, authorised slash commands —
+ * always stays in the batch, so a notice that shares a batch with an off-topic
+ * message is still delivered to the model while the off-topic message is not.
+ *
+ * An empty result means the caller must skip the provider.
  */
-export async function gateLookupTurn(
-  batch: MessageInRow[],
-  prompt: string,
-  routing: RoutingContext,
-): Promise<boolean> {
-  publishCurrentTurn(batch);
+export async function gateLookupBatch(batch: MessageInRow[], providerName: string): Promise<MessageInRow[]> {
+  publishCurrentTurn(batch, providerName);
   if (gate === undefined) gate = loadGate();
-  if (!gate) return false;
-  if (!batch.every(isUserChat)) return false;
-  if (promptHasAllowedTrigger(prompt, gate.allowedTriggers)) return false;
+  if (!gate) return batch;
 
+  const asked = batch.filter((m) => isAsked(m, providerName));
+  const waking = asked.filter((m) => m.trigger === 1);
+  if (waking.length === 0) return batch; // nobody is waiting on an answer
+  if (promptHasAllowedTrigger(formatMessages(waking), gate.allowedTriggers)) return batch;
+
+  const routing = extractRouting(asked);
   await writeMessageOut({
     id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     in_reply_to: routing.inReplyTo,
@@ -154,7 +162,9 @@ export async function gateLookupTurn(
     thread_id: routing.threadId,
     content: JSON.stringify({ text: gate.fallbackMessage }),
   });
-  markCompleted(batch.map((m) => m.id));
-  log('gate: no game trigger in turn — sent the usage card, skipped the provider');
-  return true;
+  markCompleted(asked.map((m) => m.id));
+  log('gate: no game trigger in turn — sent the usage card, kept it from the provider');
+
+  const gated = new Set(asked.map((m) => m.id));
+  return batch.filter((m) => !gated.has(m.id));
 }

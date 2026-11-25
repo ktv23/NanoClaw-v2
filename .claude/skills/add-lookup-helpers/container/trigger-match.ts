@@ -51,12 +51,27 @@ export function setCurrentTurn(text: string | null): void {
  * prompt (bare-body and test callers, where the last block is the current one).
  */
 export function currentTurnText(prompt: string): string {
+  return withoutQuotedOriginal(currentTurnBlock(prompt));
+}
+
+function currentTurnBlock(prompt: string): string {
   if (currentTurnOverride !== null) return currentTurnOverride;
   const open = /<message\b[^>]*>/gi;
   let idx = -1;
   let m: RegExpExecArray | null;
   while ((m = open.exec(prompt)) !== null) idx = m.index;
   return idx === -1 ? prompt : prompt.slice(idx);
+}
+
+/**
+ * A reply carries the message it answers as a `<quoted_message>` element at
+ * the start of its body. That is someone else's earlier text: a reply to
+ * `kdm how do survival points work?` that says `write me a poem` does not open
+ * with a trigger. The quoted text is XML-escaped, so it cannot close the
+ * element early.
+ */
+function withoutQuotedOriginal(block: string): string {
+  return block.replace(/<quoted_message\b[^>]*>[\s\S]*?<\/quoted_message>/gi, '');
 }
 
 /**

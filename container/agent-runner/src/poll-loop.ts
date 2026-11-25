@@ -233,14 +233,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // MODULE-HOOK:lookup-gate:start
+    const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+    keep = await gateLookupBatch(keep, config.providerName);
+    if (keep.length === 0) continue;
+    // MODULE-HOOK:lookup-gate:end
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, nativeSlashCommands, config.providerName);
-
-    // MODULE-HOOK:lookup-gate:start
-    const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
-    if (await gateLookupTurn(keep, prompt, routing)) continue;
-    // MODULE-HOOK:lookup-gate:end
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
@@ -535,6 +536,11 @@ export async function processQuery(
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
         if (keep.length === 0) return;
+        // MODULE-HOOK:lookup-gate-followup:start
+        const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+        keep = await gateLookupBatch(keep, providerName);
+        if (keep.length === 0) return;
+        // MODULE-HOOK:lookup-gate-followup:end
         // Re-check done — the outer query may have finished while the script
         // was awaited. Pushing into a closed stream is wasted work; the
         // claimed messages get released by the host's processing-claim sweep.
@@ -542,10 +548,6 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
-        // MODULE-HOOK:lookup-gate-followup:start
-        const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
-        if (await gateLookupTurn(keep, prompt, extractRouting(keep))) return;
-        // MODULE-HOOK:lookup-gate-followup:end
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
         archivePrompts.push(prompt);

@@ -29,7 +29,14 @@ vi.mock('../../config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-interim-nudge';
 
-import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { updateSession } from '../../db/sessions.js';
 import type { ChannelDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath } from '../../mailbox/sqlite/paths.js';
@@ -37,12 +44,14 @@ import type { MailboxHistoryMessage } from '../../mailbox/types.js';
 import { resolveSession } from '../../session-manager.js';
 import {
   checkSessions,
+  CLAIM_WINDOW_MS,
   INTERIM_FEEDBACK_MS,
   INTERIM_MAX_AGE_MS,
   INTERIM_TEXT,
   newestUserChat,
   shouldNudge,
   stopInterimFeedback,
+  type TurnView,
 } from './nudge.js';
 
 const NOW = Date.parse('2026-11-24T12:00:00.000Z');
@@ -55,48 +64,60 @@ function reply(msAgo: number): MailboxHistoryMessage {
   return { timestamp: iso(msAgo), kind: 'chat', content: JSON.stringify({ text: 'a' }) };
 }
 
+/** A view with one turn open, its claim taken `claimedMsAgo` ago (null: no open turn). */
+function view(
+  inbound: MailboxHistoryMessage[],
+  outbound: MailboxHistoryMessage[] = [],
+  claimedMsAgo: number | null = INTERIM_FEEDBACK_MS + 500,
+): TurnView {
+  return { openClaimTimes: claimedMsAgo === null ? [] : [iso(claimedMsAgo)], inbound, outbound };
+}
+
 describe('shouldNudge', () => {
-  it('nudges once a message has waited past the threshold with a turn still open', () => {
-    const decision = shouldNudge(
-      { openClaims: 1, inbound: [chat(INTERIM_FEEDBACK_MS + 1000)], outbound: [] },
-      undefined,
-      NOW,
-    );
+  it('nudges once a message has waited past the threshold with its turn still open', () => {
+    const decision = shouldNudge(view([chat(INTERIM_FEEDBACK_MS + 1000)]), undefined, NOW);
     expect(decision.nudge).toBe(true);
     expect(decision.turnKey).toBe(iso(INTERIM_FEEDBACK_MS + 1000));
   });
 
   it('waits until the threshold', () => {
-    expect(shouldNudge({ openClaims: 1, inbound: [chat(5_000)], outbound: [] }, undefined, NOW).nudge).toBe(false);
+    expect(shouldNudge(view([chat(5_000)], [], 4_000), undefined, NOW).nudge).toBe(false);
   });
 
   it('does not nudge when no turn is open', () => {
-    expect(shouldNudge({ openClaims: 0, inbound: [chat(60_000)], outbound: [] }, undefined, NOW).nudge).toBe(false);
+    expect(shouldNudge(view([chat(60_000)], [], null), undefined, NOW).nudge).toBe(false);
   });
 
   it('does not nudge twice for the same message', () => {
-    const view = { openClaims: 1, inbound: [chat(60_000)], outbound: [] };
-    expect(shouldNudge(view, iso(60_000), NOW).nudge).toBe(false);
+    expect(shouldNudge(view([chat(60_000)], [], 59_000), iso(60_000), NOW).nudge).toBe(false);
   });
 
   it('does not nudge when the agent has already said something this turn', () => {
-    const view = { openClaims: 1, inbound: [chat(60_000)], outbound: [reply(20_000)] };
-    expect(shouldNudge(view, undefined, NOW).nudge).toBe(false);
+    expect(shouldNudge(view([chat(60_000)], [reply(20_000)], 59_000), undefined, NOW).nudge).toBe(false);
   });
 
   it('ignores a reply that predates the message', () => {
-    const view = { openClaims: 1, inbound: [chat(60_000)], outbound: [reply(90_000)] };
-    expect(shouldNudge(view, undefined, NOW).nudge).toBe(true);
+    expect(shouldNudge(view([chat(60_000)], [reply(90_000)], 59_000), undefined, NOW).nudge).toBe(true);
   });
 
   it('does not nudge for an old unanswered message while some later turn is open', () => {
-    const view = { openClaims: 1, inbound: [chat(INTERIM_MAX_AGE_MS + 1000)], outbound: [] };
-    expect(shouldNudge(view, undefined, NOW).nudge).toBe(false);
+    expect(shouldNudge(view([chat(INTERIM_MAX_AGE_MS + 1000)], [], 10_000), undefined, NOW).nudge).toBe(false);
+  });
+
+  it('does not nudge when the open turn was claimed long after the message: it is some other turn', () => {
+    // Asked five minutes ago and left unanswered; a notice woke the session 40 seconds ago.
+    const fiveMinutes = 5 * 60_000;
+    expect(fiveMinutes - 40_000).toBeGreaterThan(CLAIM_WINDOW_MS);
+    expect(shouldNudge(view([chat(fiveMinutes)], [], 40_000), undefined, NOW).nudge).toBe(false);
+  });
+
+  it('allows for a cold start between the message and its claim', () => {
+    expect(shouldNudge(view([chat(60_000)], [], 40_000), undefined, NOW).nudge).toBe(true);
   });
 
   it('does not nudge for a scheduled task turn', () => {
     const task: MailboxHistoryMessage = { timestamp: iso(60_000), kind: 'task', content: '{"prompt":"daily"}' };
-    expect(shouldNudge({ openClaims: 1, inbound: [task], outbound: [] }, undefined, NOW).nudge).toBe(false);
+    expect(shouldNudge(view([task], [], 59_000), undefined, NOW).nudge).toBe(false);
   });
 });
 
@@ -128,12 +149,12 @@ describe('checkSessions (real database and session mailbox)', () => {
     db.close();
   }
 
-  function claim(messageId: string, status: 'processing' | 'completed' = 'processing'): void {
+  function claim(messageId: string, status: 'processing' | 'completed' = 'processing', takenMsAgo = 44_000): void {
     const db = new Database(outboundDbPath('ag-1', sessionId));
     db.prepare(
       `INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)
        ON CONFLICT(message_id) DO UPDATE SET status = excluded.status`,
-    ).run(messageId, status, new Date().toISOString());
+    ).run(messageId, status, iso(takenMsAgo));
     db.close();
   }
 
@@ -222,22 +243,52 @@ describe('checkSessions (real database and session mailbox)', () => {
     expect(delivered).toHaveLength(0);
   });
 
-  it('tries again on a later pass when the send fails', async () => {
+  it('makes one attempt per message, so a failing channel is not hammered', async () => {
     insertInbound('m1', 'chat-sdk', iso(45_000), { sender: 'Kevin', text: 'summarise my inbox' });
     claim('m1');
     let calls = 0;
-    const flaky: ChannelDeliveryAdapter = {
+    const failing: ChannelDeliveryAdapter = {
       async deliver() {
         calls++;
-        if (calls === 1) throw new Error('network down');
-        return undefined;
+        throw new Error('rate limited');
       },
     };
 
-    await checkSessions(flaky, NOW);
-    await checkSessions(flaky, NOW + 5_000);
-    await checkSessions(flaky, NOW + 10_000);
+    await checkSessions(failing, NOW);
+    await checkSessions(failing, NOW + 5_000);
+    await checkSessions(failing, NOW + 10_000);
 
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
+  });
+
+  it('sends nothing for an agent-shared session, whose bound chat may not be the one that asked', async () => {
+    await createMessagingGroupAgent({
+      id: 'mga-1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: iso(0),
+    });
+    insertInbound('m1', 'chat-sdk', iso(45_000), { sender: 'Kevin', text: 'summarise my inbox' });
+    claim('m1');
+
+    await checkSessions(adapter, NOW);
+
+    expect(delivered).toHaveLength(0);
+  });
+
+  it('sends nothing when the only open turn started long after the message', async () => {
+    insertInbound('m1', 'chat-sdk', iso(5 * 60_000), { sender: 'Kevin', text: 'thanks, no reply needed' });
+    insertInbound('n1', 'chat', iso(40_000), { sender: 'system', senderId: 'system', text: 'approved' });
+    claim('n1', 'processing', 40_000);
+
+    await checkSessions(adapter, NOW);
+
+    expect(delivered).toHaveLength(0);
   });
 });

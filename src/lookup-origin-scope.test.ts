@@ -17,9 +17,11 @@ const {
   mockGetMessagingGroup,
   mockGetAgentGroup,
   mockGetContainerConfig,
+  mockGetWiring,
   mockReplaceDestinations,
   mockWarn,
 } = vi.hoisted(() => ({
+  mockGetWiring: vi.fn(),
   mockGetSession: vi.fn(),
   mockGetDestinations: vi.fn(),
   mockGetMessagingGroup: vi.fn(),
@@ -38,6 +40,7 @@ vi.mock('./modules/agent-to-agent/db/agent-destinations.js', () => ({
 }));
 vi.mock('./db/messaging-groups.js', () => ({
   getMessagingGroup: (...a: unknown[]) => mockGetMessagingGroup(...a),
+  getMessagingGroupAgentByPair: (...a: unknown[]) => mockGetWiring(...a),
 }));
 vi.mock('./db/agent-groups.js', () => ({ getAgentGroup: (...a: unknown[]) => mockGetAgentGroup(...a) }));
 vi.mock('./log.js', () => ({ log: { debug: vi.fn(), warn: mockWarn, info: vi.fn(), error: vi.fn() } }));
@@ -95,6 +98,7 @@ beforeEach(() => {
   }));
   mockGetAgentGroup.mockImplementation(async (id: string) => ({ id, name: id.toUpperCase() }));
   mockGetSession.mockResolvedValue({ id: 's1', messaging_group_id: ORIGIN_MG });
+  mockGetWiring.mockResolvedValue({ session_mode: 'shared' });
   groupSelects(['mtg-helper', 'gatekeeper']);
 });
 
@@ -138,6 +142,12 @@ describe('writeDestinations origin scoping for locked-down groups', () => {
     await writeDestinations('g1', 's1');
     expect(projectedNames()).toEqual(ALL);
     expect(mockWarn).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails open for an agent-shared session, which serves every channel of the group', async () => {
+    mockGetWiring.mockResolvedValue({ session_mode: 'agent-shared' });
+    await writeDestinations('g1', 's1');
+    expect(projectedNames()).toEqual(ALL);
   });
 
   it('fails open when the group has no container config row', async () => {

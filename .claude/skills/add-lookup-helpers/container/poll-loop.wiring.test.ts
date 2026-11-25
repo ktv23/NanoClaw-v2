@@ -129,6 +129,39 @@ describe('lookup gate wiring in the poll loop', () => {
     expect(prompts).toHaveLength(1);
   });
 
+  it('a host notice sharing a batch with an off-topic question still reaches the provider, alone', async () => {
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return '<message to="table">model answer</message>';
+    });
+    insertMessage('m-a', 'what is the weather', 'thread-A');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
+         VALUES ('n-1', 'chat', datetime('now'), 'pending', 'ag-1', 'agent', ?)`,
+      )
+      .run(JSON.stringify({ sender: 'system', senderId: 'system', text: 'Your last reply could NOT be delivered.' }));
+
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider,
+      providerContract: CONTRACT,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    await sleep(300);
+    controller.abort();
+    await loop.catch(() => {});
+
+    expect(texts().sort()).toEqual([FALLBACK, 'model answer'].sort());
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('could NOT be delivered');
+    expect(prompts[0]).not.toContain('what is the weather');
+  });
+
   it('with no enforcing skill selected, a code-less turn reaches the provider as usual', async () => {
     fs.rmSync(path.join(dir, 'gatekeeper'), { recursive: true, force: true });
     resetGateForTest(dir);

@@ -8,11 +8,11 @@ description: Add data-driven lookup helpers. A container skill that ships a help
 A lookup helper is a container skill that answers from an on-disk archive when a message opens with its trigger word. This skill adds the runtime that makes a helper reliable:
 
 - **Directives.** A container skill may ship `helper.json` at its root: `{ "trigger": "kdm", "directive": "…per-turn instructions…" }`. When the message that engaged a turn opens with the trigger, the directive is injected into that turn through the Claude provider's `UserPromptSubmit` hook. An empty trigger injects on every turn.
-- **Gate.** A skill whose `helper.json` declares `"enforce": true` and a `fallback_message` is a gatekeeper. A group that selects it answers only turns that open with one of its selected helpers' triggers; any other chat message from a person gets the fallback message and never reaches the model. Tasks, webhooks, system messages and notices the host addresses to the agent pass through.
+- **Gate.** A skill whose `helper.json` declares `"enforce": true` and a `fallback_message` is a gatekeeper. A group that selects it answers only turns that open with one of its selected helpers' triggers; any other chat message from a person gets the fallback message and never reaches the model. Tasks, webhooks, system messages, notices the host addresses to the agent, and slash commands the host has authorised pass through.
 - **Opt-in lockdown.** A gatekeeper skill is never part of `skills: 'all'`. A group gets it only by listing it.
 - **Answers stay where they were asked.** A group that selected a gatekeeper and is wired to several channels can address, from a chat session, only the channel that session came from. Without this a question asked in one channel can be answered into a sibling channel. Groups with no gatekeeper keep every destination.
 
-The trigger is matched at the start of the message body, past any leading @mention, against the message that engaged the turn. Directives and the gate share one matcher, so they always agree on what counts as a helper turn.
+The trigger is matched at the start of the message body, past any leading @mention, against the message that engaged the turn. The quoted original of a reply does not count. Directives and the gate share one matcher and read the same set of skills (the ones the group selected), so they always agree on what counts as a helper turn.
 
 Helper skills themselves (their archives, `SKILL.md` and `helper.json`) are content: put them under `container/skills/<name>/`. This skill installs only the runtime.
 
@@ -45,23 +45,25 @@ Skip both edits if `grep -q lookupHelperPromptHook container/agent-runner/src/pr
 
 ### 3. Consult the gate in the poll loop
 
-In `container/agent-runner/src/poll-loop.ts`, the gate is one call at each of the two places a batch is about to reach the provider. Skip either block that `grep -n 'MODULE-HOOK:lookup-gate' container/agent-runner/src/poll-loop.ts` already shows.
+In `container/agent-runner/src/poll-loop.ts`, the gate is one call at each of the two places a batch is about to be formatted for the provider. It returns the rows that should still go to the provider. Skip either block that `grep -n 'MODULE-HOOK:lookup-gate' container/agent-runner/src/poll-loop.ts` already shows.
 
-In `runPollLoop`, directly after the initial batch's prompt is formatted (`const prompt = formatMessagesWithCommands(...)`):
+In `runPollLoop`, directly before the initial batch's prompt is formatted (the `// Format messages:` comment above `const prompt = formatMessagesWithCommands(...)`):
 
 ```ts
     // MODULE-HOOK:lookup-gate:start
-    const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
-    if (await gateLookupTurn(keep, prompt, routing)) continue;
+    const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+    keep = await gateLookupBatch(keep, config.providerName);
+    if (keep.length === 0) continue;
     // MODULE-HOOK:lookup-gate:end
 ```
 
-In `processQuery`'s follow-up poller, directly after the follow-up prompt is formatted (`const prompt = formatMessages(keep);`):
+In `processQuery`'s follow-up poller, directly after the pre-task scripts' `if (keep.length === 0) return;` and before the `// Re-check done` comment, so that re-check also covers this call:
 
 ```ts
         // MODULE-HOOK:lookup-gate-followup:start
-        const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
-        if (await gateLookupTurn(keep, prompt, extractRouting(keep))) return;
+        const { gateLookupBatch } = await import('./lookup-helpers/gate.js');
+        keep = await gateLookupBatch(keep, providerName);
+        if (keep.length === 0) return;
         // MODULE-HOOK:lookup-gate-followup:end
 ```
 

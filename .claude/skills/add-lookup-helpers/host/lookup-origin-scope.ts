@@ -16,11 +16,15 @@
  * unable to reply at all:
  *  - the session has no channel origin (task and agent-to-agent sessions);
  *  - the origin is not among the group's channel destinations (a wiring with
- *    no destination row).
+ *    no destination row);
+ *  - the session is `agent-shared`: one session then serves every channel of
+ *    the group, and the chat it happens to be bound to is not "where it was
+ *    asked".
  */
 import path from 'path';
 
 import { getContainerConfig } from './db/container-configs.js';
+import { getMessagingGroupAgentByPair } from './db/messaging-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import { selectsLockdownSkill } from './lookup-lockdown.js';
@@ -54,6 +58,9 @@ export async function scopeToSessionOrigin<T extends ScopableDestination>(
 
   const originMessagingGroupId = (await getSession(sessionId))?.messaging_group_id ?? null;
   if (originMessagingGroupId == null) return rows;
+
+  const wiring = await getMessagingGroupAgentByPair(originMessagingGroupId, agentGroupId);
+  if (wiring?.session_mode === 'agent-shared') return rows;
 
   if (!channelRows.some((r) => r.target_id === originMessagingGroupId)) {
     log.warn('Destination origin not found among channel destinations — skipping origin scope', {

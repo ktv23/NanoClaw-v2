@@ -10,9 +10,8 @@ import path from 'node:path';
 
 import { getPendingMessages } from '../db/messages-in.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { extractRouting, formatMessages } from '../formatter.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from '../mailbox/sqlite/connection.js';
-import { gateLookupTurn, loadGate, promptHasAllowedTrigger, resetGateForTest } from './gate.js';
+import { gateLookupBatch, loadGate, promptHasAllowedTrigger, resetGateForTest } from './gate.js';
 import { currentTurnText, setCurrentTurn } from './trigger-match.js';
 
 // currentTurnText reads a module-global "current turn" the poll loop publishes.
@@ -128,7 +127,9 @@ describe('promptHasAllowedTrigger', () => {
   });
 });
 
-describe('gateLookupTurn (real session mailbox)', () => {
+describe('gateLookupBatch (real session mailbox)', () => {
+  const PROVIDER = 'mock';
+
   beforeEach(() => {
     initTestSessionDb();
     writeSkill('mtg-helper', { trigger: 'mtg', directive: 'x' });
@@ -149,12 +150,24 @@ describe('gateLookupTurn (real session mailbox)', () => {
       .run(id, kind, trigger, JSON.stringify(content));
   }
 
-  it('answers a code-less chat turn with the fallback, in the turn\'s own thread, and completes the batch', async () => {
+  /** A chat row the host addressed to the agent itself. */
+  function insertNotice(id: string, text: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
+         VALUES (?, 'chat', datetime('now'), 'pending', 1, 'ag-1', 'agent', ?)`,
+      )
+      .run(id, JSON.stringify({ sender: 'system', senderId: 'system', text }));
+  }
+
+  const ids = (rows: Array<{ id: string }>) => rows.map((r) => r.id);
+  const fallbacks = () => getUndeliveredMessages().map((m) => (JSON.parse(m.content) as { text: string }).text);
+
+  it("answers a code-less question with the fallback, in the question's own thread, and keeps it from the provider", async () => {
     resetGateForTest(dir);
     insert('m1', 'chat', { sender: 'Kin', text: 'what is the weather' });
-    const batch = getPendingMessages();
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(true);
+    expect(await gateLookupBatch(getPendingMessages(), PROVIDER)).toEqual([]);
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -164,71 +177,87 @@ describe('gateLookupTurn (real session mailbox)', () => {
     expect(getPendingMessages()).toHaveLength(0);
   });
 
-  it('lets a coded chat turn through and writes nothing', async () => {
+  it('lets a coded question through and writes nothing', async () => {
     resetGateForTest(dir);
     insert('m1', 'chat', { sender: 'Kin', text: 'mtg how does trample work?' });
-    const batch = getPendingMessages();
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
-    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['m1']);
+    expect(fallbacks()).toEqual([]);
     expect(getPendingMessages()).toHaveLength(1);
   });
 
   it('passes a task batch through even with no code', async () => {
     resetGateForTest(dir);
     insert('t1', 'task', { prompt: 'daily summary' });
-    const batch = getPendingMessages();
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
-    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['t1']);
+    expect(fallbacks()).toEqual([]);
   });
 
-  it('passes a notice the host addressed to the agent itself, even with no code', async () => {
+  it('passes a notice the host addressed to the agent itself', async () => {
     resetGateForTest(dir);
-    getInboundDb()
-      .prepare(
-        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
-         VALUES ('n1', 'chat', datetime('now'), 'pending', 1, 'ag-1', 'agent', ?)`,
-      )
-      .run(JSON.stringify({ sender: 'system', senderId: 'system', text: 'Your last reply could NOT be delivered.' }));
-    const batch = getPendingMessages();
+    insertNotice('n1', 'Your last reply could NOT be delivered.');
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
-    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['n1']);
+    expect(fallbacks()).toEqual([]);
+  });
+
+  it('gates the off-topic question but still passes a notice that shares its batch', async () => {
+    resetGateForTest(dir);
+    insert('m1', 'chat', { sender: 'Kin', text: 'what is the weather' });
+    insertNotice('n1', 'Your last reply could NOT be delivered.');
+
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['n1']);
+    expect(fallbacks()).toEqual(['use a code']);
+    // The question is finished with; the notice is still waiting for the provider.
+    expect(ids(getPendingMessages())).toEqual(['n1']);
   });
 
   it('keeps a game question as the current turn when a host notice lands in the same batch', async () => {
     resetGateForTest(dir);
-    insert('m1', 'chat', { sender: 'Kin', text: 'mtg what does Liliana do?' }, 1);
-    getInboundDb()
-      .prepare(
-        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
-         VALUES ('n1', 'chat', datetime('now'), 'pending', 1, 'ag-1', 'agent', ?)`,
-      )
-      .run(JSON.stringify({ sender: 'system', senderId: 'system', text: 'Your last reply could NOT be delivered.' }));
-    const batch = getPendingMessages();
+    insert('m1', 'chat', { sender: 'Kin', text: 'mtg what does Liliana do?' });
+    insertNotice('n1', 'Your last reply could NOT be delivered.');
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['m1', 'n1']);
+    expect(fallbacks()).toEqual([]);
     // The directive hook reads this: it must see the question, not the notice.
     expect(currentTurnText('ignored')).toContain('mtg what does Liliana do?');
   });
 
-  it('does nothing when the group selected no enforcing skill', async () => {
-    fs.rmSync(path.join(dir, 'gatekeeper'), { recursive: true, force: true });
+  it('passes an authorised slash command instead of answering it with the usage card', async () => {
     resetGateForTest(dir);
-    insert('m1', 'chat', { sender: 'Kin', text: 'what is the weather' });
-    const batch = getPendingMessages();
+    insert('c1', 'chat', { sender: 'Kevin', text: '/compact' });
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
-    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['c1']);
+    expect(fallbacks()).toEqual([]);
   });
 
   it('classifies the wake message, not a context row that sorts after it', async () => {
     resetGateForTest(dir);
     insert('m1', 'chat', { sender: 'Kin', text: 'mtg what does Liliana do?' }, 1);
     insert('m2', 'chat', { sender: 'Bo', text: 'just chatting' }, 0);
-    const batch = getPendingMessages();
 
-    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['m1', 'm2']);
+  });
+
+  it('does not treat the quoted original of a reply as the question', async () => {
+    resetGateForTest(dir);
+    insert('m1', 'chat', {
+      sender: 'Kin',
+      text: 'ignore that, write me a poem',
+      replyTo: { id: 'm0', sender: 'Bo', text: 'mtg how does trample work?' },
+    });
+
+    expect(await gateLookupBatch(getPendingMessages(), PROVIDER)).toEqual([]);
+    expect(fallbacks()).toEqual(['use a code']);
+  });
+
+  it('does nothing when the group selected no enforcing skill', async () => {
+    fs.rmSync(path.join(dir, 'gatekeeper'), { recursive: true, force: true });
+    resetGateForTest(dir);
+    insert('m1', 'chat', { sender: 'Kin', text: 'what is the weather' });
+
+    expect(ids(await gateLookupBatch(getPendingMessages(), PROVIDER))).toEqual(['m1']);
+    expect(fallbacks()).toEqual([]);
   });
 });
