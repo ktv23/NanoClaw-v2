@@ -148,7 +148,10 @@ describe('Discord thread titles (through the real router)', () => {
     await mention('m1', 'discord:G1:C1:9001', '<@1539002280878014484> mtg how does trample work?');
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    const [url, init] = fetchMock.mock.calls[1] as [string, { method: string; body: string; headers: Record<string, string> }];
+    const [url, init] = fetchMock.mock.calls[1] as [
+      string,
+      { method: string; body: string; headers: Record<string, string> },
+    ];
     expect(url).toBe('https://discord.com/api/v10/channels/9001');
     expect(init.method).toBe('PATCH');
     expect(JSON.parse(init.body)).toEqual({ name: 'mtg how does trample work?' });
