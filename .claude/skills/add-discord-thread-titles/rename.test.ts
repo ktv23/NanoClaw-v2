@@ -3,7 +3,7 @@
  * derivation and the cases the rename skips. The wiring is covered by
  * discord-thread-titles.test.ts.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 vi.mock('../../log.js', () => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
@@ -35,11 +35,16 @@ function event(overrides: {
   } as unknown as SessionCreatedEvent;
 }
 
-let fetchMock: ReturnType<typeof vi.fn>;
+type FetchLike = (
+  url: string,
+  init?: { method?: string; body?: string; headers?: Record<string, string> },
+) => Promise<{ ok: boolean; status?: number; json: () => Promise<unknown> }>;
+
+let fetchMock: Mock<FetchLike>;
 
 beforeEach(() => {
   vi.stubEnv('DISCORD_BOT_TOKEN', 'test-token');
-  fetchMock = vi.fn(async (_url: string, init?: { method?: string }) =>
+  fetchMock = vi.fn<FetchLike>(async (_url, init) =>
     init?.method === 'PATCH'
       ? { ok: true, json: async () => ({}) }
       : { ok: true, json: async () => ({ name: 'Thread 8/18/2026, 8:28 AM' }) },
@@ -57,7 +62,7 @@ describe('nameSpawnedDiscordThread', () => {
   it('renames an auto-named Discord group thread', async () => {
     await nameSpawnedDiscordThread(event({}));
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(JSON.parse((fetchMock.mock.calls[1][1] as { body: string }).body)).toEqual({ name: 'mtg what is trample?' });
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body ?? '{}')).toEqual({ name: 'mtg what is trample?' });
   });
 
   it('skips another platform', async () => {
@@ -93,7 +98,7 @@ describe('nameSpawnedDiscordThread', () => {
   });
 
   it('logs a rename Discord refuses, since a 403 or 429 is not an exception', async () => {
-    fetchMock.mockImplementation(async (_url: string, init?: { method?: string }) =>
+    fetchMock.mockImplementation(async (_url, init) =>
       init?.method === 'PATCH'
         ? { ok: false, status: 403, json: async () => ({}) }
         : { ok: true, status: 200, json: async () => ({ name: 'Thread 8/18/2026, 8:28 AM' }) },
