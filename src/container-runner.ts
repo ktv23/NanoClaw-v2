@@ -40,6 +40,7 @@ import {
   tryClaimSession,
   type SessionClaimRow,
 } from './db/coordination.js';
+import { withHostGatewayNoProxy } from './host-gateway-no-proxy.js';
 import { getHostInstanceId } from './host-instance.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getSession } from './db/sessions.js';
@@ -1443,10 +1444,10 @@ export function composeSessionSpec(input: ComposeSessionSpecInput): SessionSpec 
   // The model provider's contribution fills first, the gateway's second — a
   // gateway wins a key collision, the override the old raw-argv append got
   // from Docker's last-wins rule.
-  const contributedEnv: Record<string, string> = {
+  const contributedEnv: Record<string, string> = withHostGatewayNoProxy({
     ...(contribution.env ?? {}),
     ...(gateway.env ?? {}),
-  };
+  });
 
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
