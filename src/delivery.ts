@@ -456,6 +456,7 @@ async function failDelivery(
       err,
     });
     await markFailed(msg, session, agentGroup);
+    void (await import('./modules/interim-feedback/delivery-failure.js')).notifyDeliveryFailure(session, msg, err);
   } else {
     log.warn('Message delivery failed, will retry', {
       messageId: msg.id,
