@@ -237,6 +237,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, nativeSlashCommands, config.providerName);
 
+    // MODULE-HOOK:lookup-gate:start
+    const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
+    if (await gateLookupTurn(keep, prompt, routing)) continue;
+    // MODULE-HOOK:lookup-gate:end
+
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
     const query = config.provider.query({
@@ -537,6 +542,10 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
+        // MODULE-HOOK:lookup-gate-followup:start
+        const { gateLookupTurn } = await import('./lookup-helpers/gate.js');
+        if (await gateLookupTurn(keep, prompt, extractRouting(keep))) return;
+        // MODULE-HOOK:lookup-gate-followup:end
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
         archivePrompts.push(prompt);

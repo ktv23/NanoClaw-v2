@@ -60,6 +60,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { withoutLockdownSkills } from './lookup-lockdown.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider contracts use a separate barrel so update-skills identity detection
 // remains tied to src/providers/index.ts.
@@ -1600,7 +1601,8 @@ function selectedSkillNames(containerConfig: import('./container-config.js').Con
         }
       })
     : [];
-  const selected = containerConfig.skills === 'all' ? available : containerConfig.skills;
+  const selected =
+    containerConfig.skills === 'all' ? withoutLockdownSkills(sharedSkillsDir, available) : containerConfig.skills;
   return selectGatewayAgentSkills(selected);
 }
 
