@@ -26,9 +26,10 @@ function repoRoot(): string {
 const EXACT_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
 describe('the Gmail and Google Calendar MCP servers are installed in the agent image', () => {
-  const manifest = JSON.parse(
-    fs.readFileSync(path.join(repoRoot(), 'container', 'cli-tools.json'), 'utf8'),
-  ) as Array<{ name: string; version: string }>;
+  const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot(), 'container', 'cli-tools.json'), 'utf8')) as Array<{
+    name: string;
+    version: string;
+  }>;
   const entry = (name: string) => manifest.find((t) => t.name === name);
 
   it.each(['@gongrzhe/server-gmail-autoauth-mcp', '@cocal/google-calendar-mcp'])(

@@ -57,7 +57,11 @@ function reply(msAgo: number): MailboxHistoryMessage {
 
 describe('shouldNudge', () => {
   it('nudges once a message has waited past the threshold with a turn still open', () => {
-    const decision = shouldNudge({ openClaims: 1, inbound: [chat(INTERIM_FEEDBACK_MS + 1000)], outbound: [] }, undefined, NOW);
+    const decision = shouldNudge(
+      { openClaims: 1, inbound: [chat(INTERIM_FEEDBACK_MS + 1000)], outbound: [] },
+      undefined,
+      NOW,
+    );
     expect(decision.nudge).toBe(true);
     expect(decision.turnKey).toBe(iso(INTERIM_FEEDBACK_MS + 1000));
   });
@@ -105,7 +109,13 @@ describe('newestUserChat', () => {
 });
 
 describe('checkSessions (real database and session mailbox)', () => {
-  let delivered: Array<{ channelType: string; platformId: string; threadId: string | null; content: string; instance?: string }>;
+  let delivered: Array<{
+    channelType: string;
+    platformId: string;
+    threadId: string | null;
+    content: string;
+    instance?: string;
+  }>;
   let adapter: ChannelDeliveryAdapter;
   let sessionId: string;
 
