@@ -66,16 +66,47 @@ These steps change the install, not the source tree, so no test in the tree can 
 If `~/.gmail-mcp/credentials.json` exists and does not contain `onecli-managed`, stop: it holds real credentials from an older setup. Back the directory up and remove it first. The same goes for `~/.calendar-mcp`.
 
 ```bash
-for d in ~/.gmail-mcp ~/.calendar-mcp; do
-  mkdir -p "$d"
-  cat > "$d/gcp-oauth.keys.json" <<'JSON'
-{ "installed": { "client_id": "onecli-managed.apps.googleusercontent.com", "client_secret": "onecli-managed", "redirect_uris": ["http://localhost"] } }
+mkdir -p ~/.gmail-mcp
+cat > ~/.gmail-mcp/gcp-oauth.keys.json <<'JSON'
+{
+  "installed": {
+    "client_id": "onecli-managed.apps.googleusercontent.com",
+    "client_secret": "onecli-managed",
+    "redirect_uris": ["http://localhost:3000/oauth2callback"]
+  }
+}
 JSON
-  cat > "$d/credentials.json" <<'JSON'
-{ "access_token": "onecli-managed", "refresh_token": "onecli-managed", "token_type": "Bearer", "expiry_date": 99999999999999 }
+cat > ~/.gmail-mcp/credentials.json <<'JSON'
+{
+  "access_token": "onecli-managed",
+  "refresh_token": "onecli-managed",
+  "token_type": "Bearer",
+  "expiry_date": 99999999999999,
+  "scope": "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send"
+}
 JSON
-  chmod 600 "$d/gcp-oauth.keys.json" "$d/credentials.json"
-done
+
+mkdir -p ~/.calendar-mcp
+cat > ~/.calendar-mcp/gcp-oauth.keys.json <<'JSON'
+{
+  "installed": {
+    "client_id": "onecli-managed.apps.googleusercontent.com",
+    "client_secret": "onecli-managed",
+    "redirect_uris": ["http://localhost:3000/oauth2callback"]
+  }
+}
+JSON
+cat > ~/.calendar-mcp/credentials.json <<'JSON'
+{
+  "access_token": "onecli-managed",
+  "refresh_token": "onecli-managed",
+  "token_type": "Bearer",
+  "expiry_date": 99999999999999,
+  "scope": "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events"
+}
+JSON
+
+chmod 600 ~/.gmail-mcp/*.json ~/.calendar-mcp/*.json
 ```
 
 ### 2. Mount them into the group
