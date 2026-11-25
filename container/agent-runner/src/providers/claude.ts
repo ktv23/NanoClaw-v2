@@ -583,7 +583,10 @@ export class ClaudeProvider implements AgentProvider {
 
   maybeRotateContinuation(continuation: string): string | null {
     const transcriptPath = findTranscriptPath(continuation);
-    if (!transcriptPath) return null;
+    // The stored continuation outlives the transcript: Claude Code deletes old
+    // .jsonl files (cleanupPeriodDays, default 30). Resuming without one always
+    // errors and drops the user's message, so start fresh instead.
+    if (!transcriptPath) return `transcript missing for ${continuation}`;
 
     let size: number;
     try {

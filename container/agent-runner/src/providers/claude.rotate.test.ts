@@ -82,8 +82,17 @@ describe('ClaudeProvider.maybeRotateContinuation', () => {
     expect(provider.maybeRotateContinuation('sess-old', CWD)).toContain('d');
   });
 
-  it('returns null for an unknown session id', () => {
+  it('drops a continuation whose transcript is missing', () => {
+    // Claude Code deletes old transcripts (cleanupPeriodDays) while the stored
+    // continuation lives forever; resuming one posts an error to the channel
+    // and drops the user's message.
+    writeTranscript('sess-other', 4096);
     const provider = new ClaudeProvider();
-    expect(provider.maybeRotateContinuation('does-not-exist', CWD)).toBeNull();
+    expect(provider.maybeRotateContinuation('does-not-exist', CWD)).toContain('missing');
+  });
+
+  it('drops the continuation when no transcripts exist at all', () => {
+    const provider = new ClaudeProvider();
+    expect(provider.maybeRotateContinuation('does-not-exist', CWD)).toContain('missing');
   });
 });
