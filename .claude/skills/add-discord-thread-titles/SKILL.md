@@ -22,7 +22,7 @@ The Discord channel is installed (`src/channels/discord.ts` exists) and `DISCORD
 ```bash
 S=.claude/skills/add-discord-thread-titles
 mkdir -p src/modules/discord-thread-titles
-cp $S/index.ts $S/discord-thread-titles.test.ts src/modules/discord-thread-titles/
+cp $S/index.ts $S/rename.ts $S/rename.test.ts $S/discord-thread-titles.test.ts src/modules/discord-thread-titles/
 ```
 
 ### 2. Load it from the modules barrel
@@ -39,10 +39,10 @@ Skip if `grep -q discord-thread-titles src/modules/index.ts` already matches.
 
 ```bash
 pnpm run build
-pnpm exec vitest run src/modules/discord-thread-titles/discord-thread-titles.test.ts
+pnpm exec vitest run src/modules/discord-thread-titles/
 ```
 
-The test loads the module through the real modules barrel and sends a mention through the real router, with Discord's API stubbed. It goes red if the barrel line is removed.
+`discord-thread-titles.test.ts` loads the module only through the real modules barrel and sends a mention through the real router, with Discord's API stubbed. It goes red if the barrel line is removed. `rename.test.ts` covers the cases the rename skips.
 
 The rename starts working once the host restarts.
 

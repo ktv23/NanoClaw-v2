@@ -37,9 +37,9 @@ import {
   runMigrations,
 } from '../../db/index.js';
 import { routeInbound } from '../../router.js';
-// The real barrel: this is the line under test.
+// The real barrel, and nothing from this module directly: the barrel line is
+// what is under test, and a direct import would register the hook by itself.
 import '../index.js';
-import { deriveThreadTitle } from './index.js';
 
 const channelDefaults: ChannelDefaults = {
   dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
@@ -177,26 +177,5 @@ describe('Discord thread titles (through the real router)', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-});
-
-describe('deriveThreadTitle', () => {
-  it('strips user, nickname and role mentions and collapses whitespace', () => {
-    expect(deriveThreadTitle(JSON.stringify({ text: '<@1> <@!2> <@&3>  mtg   what   is trample?' }))).toBe(
-      'mtg what is trample?',
-    );
-  });
-
-  it('caps the title at 90 characters', () => {
-    expect(deriveThreadTitle(JSON.stringify({ text: 'x'.repeat(200) }))).toHaveLength(90);
-  });
-
-  it('returns an empty title for a message with no text', () => {
-    expect(deriveThreadTitle(JSON.stringify({ text: '<@1>' }))).toBe('');
-    expect(deriveThreadTitle(JSON.stringify({ attachments: [{ name: 'photo.jpg' }] }))).toBe('');
-  });
-
-  it('uses non-JSON content verbatim', () => {
-    expect(deriveThreadTitle('plain text')).toBe('plain text');
   });
 });
