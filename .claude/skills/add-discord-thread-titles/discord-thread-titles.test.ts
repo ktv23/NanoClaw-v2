@@ -5,7 +5,7 @@
  * barrel import is removed.
  */
 import fs from 'fs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 // Mock container runner to prevent actual Docker spawning
 vi.mock('../../container-runner.js', () => ({
@@ -114,10 +114,15 @@ async function mention(id: string, threadId: string, text: string): Promise<void
   });
 }
 
-let fetchMock: ReturnType<typeof vi.fn>;
+type FetchLike = (
+  url: string,
+  init?: { method?: string; body?: string; headers?: Record<string, string> },
+) => Promise<{ ok: boolean; json: () => Promise<unknown> }>;
+
+let fetchMock: Mock<FetchLike>;
 
 function discordReturnsThreadNamed(name: string): void {
-  fetchMock.mockImplementation(async (_url: string, init?: { method?: string }) => {
+  fetchMock.mockImplementation(async (_url, init) => {
     if (init?.method === 'PATCH') return { ok: true, json: async () => ({}) };
     return { ok: true, json: async () => ({ name }) };
   });
@@ -128,7 +133,7 @@ beforeEach(async () => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   await runMigrations(await initTestDb());
   vi.stubEnv('DISCORD_BOT_TOKEN', 'test-token');
-  fetchMock = vi.fn();
+  fetchMock = vi.fn<FetchLike>();
   vi.stubGlobal('fetch', fetchMock);
   await seed();
 });
