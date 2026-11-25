@@ -13,9 +13,10 @@ import type { Destination } from '../../mailbox/index.js';
 import { log } from '../../log.js';
 import { withMailboxSession } from '../../session-manager.js';
 import { getDestinations } from './db/agent-destinations.js';
+import { scopeToSessionOrigin } from './origin-scope.js';
 
 export async function writeDestinations(agentGroupId: string, sessionId: string): Promise<void> {
-  const rows = await getDestinations(agentGroupId);
+  const rows = await scopeToSessionOrigin(await getDestinations(agentGroupId), sessionId);
   const resolved: Destination[] = [];
 
   for (const row of rows) {
