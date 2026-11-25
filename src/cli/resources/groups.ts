@@ -38,6 +38,7 @@ import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 import { localizeIsoTimestamps } from '../format.js';
 import { projectDestinationsToSessions } from './destinations.js';
+import { skillsConfigOperations } from './groups-skills-config.js';
 
 /**
  * Parse a --timezone flag: undefined = not passed, null = explicit clear
@@ -126,6 +127,7 @@ registerResource({
   // DELETE violates FK constraints (#2525).
   operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
+    ...skillsConfigOperations,
     connect: {
       access: 'open',
       description:
