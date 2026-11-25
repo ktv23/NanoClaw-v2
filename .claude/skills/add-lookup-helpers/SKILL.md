@@ -8,7 +8,7 @@ description: Add data-driven lookup helpers. A container skill that ships a help
 A lookup helper is a container skill that answers from an on-disk archive when a message opens with its trigger word. This skill adds the runtime that makes a helper reliable:
 
 - **Directives.** A container skill may ship `helper.json` at its root: `{ "trigger": "kdm", "directive": "…per-turn instructions…" }`. When the message that engaged a turn opens with the trigger, the directive is injected into that turn through the Claude provider's `UserPromptSubmit` hook. An empty trigger injects on every turn.
-- **Gate.** A skill whose `helper.json` declares `"enforce": true` and a `fallback_message` is a gatekeeper. A group that selects it answers only turns that open with one of its selected helpers' triggers; any other chat turn gets the fallback message and never reaches the model. Tasks, webhooks and system messages pass through.
+- **Gate.** A skill whose `helper.json` declares `"enforce": true` and a `fallback_message` is a gatekeeper. A group that selects it answers only turns that open with one of its selected helpers' triggers; any other chat message from a person gets the fallback message and never reaches the model. Tasks, webhooks, system messages and notices the host addresses to the agent pass through.
 - **Opt-in lockdown.** A gatekeeper skill is never part of `skills: 'all'`. A group gets it only by listing it.
 
 The trigger is matched at the start of the message body, past any leading @mention, against the message that engaged the turn. Directives and the gate share one matcher, so they always agree on what counts as a helper turn.

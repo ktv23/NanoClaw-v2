@@ -183,6 +183,20 @@ describe('gateLookupTurn (real session mailbox)', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
+  it('passes a notice the host addressed to the agent itself, even with no code', async () => {
+    resetGateForTest(dir);
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
+         VALUES ('n1', 'chat', datetime('now'), 'pending', 1, 'ag-1', 'agent', ?)`,
+      )
+      .run(JSON.stringify({ sender: 'system', senderId: 'system', text: 'Your last reply could NOT be delivered.' }));
+    const batch = getPendingMessages();
+
+    expect(await gateLookupTurn(batch, formatMessages(batch), extractRouting(batch))).toBe(false);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
   it('does nothing when the group selected no enforcing skill', async () => {
     fs.rmSync(path.join(dir, 'gatekeeper'), { recursive: true, force: true });
     resetGateForTest(dir);

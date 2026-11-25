@@ -108,13 +108,25 @@ function publishCurrentTurn(batch: MessageInRow[]): void {
 }
 
 /**
+ * A chat message from a person on a platform. Chat rows the host or another
+ * agent addressed to this agent (channel `agent`: an approval result, a
+ * delivery-failure notice) and session echoes are not something a person
+ * typed, so they are never gated.
+ */
+function isUserChat(m: MessageInRow): boolean {
+  if (m.kind !== 'chat' && m.kind !== 'chat-sdk') return false;
+  return m.channel_type !== 'agent' && m.channel_type !== 'session-echo';
+}
+
+/**
  * The poll loop's single call, made for every batch before it reaches the
  * provider (the initial batch and each follow-up pushed into a warm query).
  *
  * Always publishes the current turn. Then, when a gate is active and this is a
  * user-chat batch with no allowed trigger, writes the fallback message to
  * `routing`, marks the batch completed, and returns true: the caller must skip
- * the provider. Tasks, webhooks and system messages pass straight through.
+ * the provider. Tasks, webhooks, system messages and notices addressed to the
+ * agent itself pass straight through.
  */
 export async function gateLookupTurn(
   batch: MessageInRow[],
@@ -124,7 +136,7 @@ export async function gateLookupTurn(
   publishCurrentTurn(batch);
   if (gate === undefined) gate = loadGate();
   if (!gate) return false;
-  if (!batch.every((m) => m.kind === 'chat' || m.kind === 'chat-sdk')) return false;
+  if (!batch.every(isUserChat)) return false;
   if (promptHasAllowedTrigger(prompt, gate.allowedTriggers)) return false;
 
   await writeMessageOut({
