@@ -6,15 +6,21 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockGetSession, mockGetDestinations, mockGetMessagingGroup, mockGetAgentGroup, mockReplaceDestinations, mockWarn } =
-  vi.hoisted(() => ({
-    mockGetSession: vi.fn(),
-    mockGetDestinations: vi.fn(),
-    mockGetMessagingGroup: vi.fn(),
-    mockGetAgentGroup: vi.fn(),
-    mockReplaceDestinations: vi.fn(),
-    mockWarn: vi.fn(),
-  }));
+const {
+  mockGetSession,
+  mockGetDestinations,
+  mockGetMessagingGroup,
+  mockGetAgentGroup,
+  mockReplaceDestinations,
+  mockWarn,
+} = vi.hoisted(() => ({
+  mockGetSession: vi.fn(),
+  mockGetDestinations: vi.fn(),
+  mockGetMessagingGroup: vi.fn(),
+  mockGetAgentGroup: vi.fn(),
+  mockReplaceDestinations: vi.fn(),
+  mockWarn: vi.fn(),
+}));
 
 vi.mock('../../db/sessions.js', () => ({ getSession: (...a: unknown[]) => mockGetSession(...a) }));
 vi.mock('./db/agent-destinations.js', () => ({ getDestinations: (...a: unknown[]) => mockGetDestinations(...a) }));
