@@ -76,4 +76,3 @@ export async function nameSpawnedDiscordThread(event: SessionCreatedEvent): Prom
     log.warn('Discord thread rename failed', { threadId: event.threadId, err });
   }
 }
-
